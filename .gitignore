@@ -1,0 +1,39 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments and local Python versions
+.venv/
+.env
+.env.*
+.python-version
+
+# Build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tool caches and coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Local secrets/config
+github_tokens.yml
+github_tokens.yml
+crawler_config.yml

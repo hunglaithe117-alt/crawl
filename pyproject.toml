@@ -1,0 +1,34 @@
+[project]
+name = "ci-crawler"
+version = "0.1.0"
+description = "Continuous crawler for GitHub Actions/Travis CI with Mongo-backed token pool"
+requires-python = ">=3.10"
+dependencies = [
+  "pymongo>=4.6",
+  "requests>=2.31",
+  "PyYAML>=6.0",
+  "pyarrow>=22.0.0",
+  "duckdb>=1.4.2",
+  "pandas>=2.3.3",
+  "tqdm>=4.67.1",
+]
+
+[project.scripts]
+ci-crawler = "build_log_scanner.scanner:main"
+
+[tool.uv]
+# Add dev-dependencies here if needed, e.g. "pytest>=7.4"
+
+[tool.hatch.build.targets.wheel]
+packages = ["build_log_scanner", "enrich"]
+include = [
+  "github_api_client.py",
+  "check_github_projects.py",
+  "run_enrichment.py",
+  "crawler_config.yml",
+  "build_log_scanner/scanner_config.yml",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
