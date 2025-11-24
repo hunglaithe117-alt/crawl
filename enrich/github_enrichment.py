@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 # Add parent directory to path to import github_api_client and token_pool
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from github_api_client import GitHubAPIClient
-from token_pool import MongoTokenPool, GitHubTokenPoolAdapter
+from token_pool import MongoTokenPool, GitHubTokenPoolAdapter, InMemoryTokenPool
 
 # Setup logging
 logging.basicConfig(
@@ -562,6 +562,11 @@ def main():
         action="store_true",
         help="Merge results into per-project CSVs at the end",
     )
+    parser.add_argument(
+        "--no-mongo",
+        action="store_true",
+        help="Use in-memory token pool instead of MongoDB",
+    )
     args = parser.parse_args()
 
     # Priority: Env Var > Args
@@ -569,6 +574,11 @@ def main():
     OUTPUT_DIR = os.environ.get("OUTPUT_DIR", args.output_dir)
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", args.batch_size))
     ENABLE_MERGE = os.environ.get("ENABLE_MERGE", str(args.merge)).lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+    NO_MONGO = os.environ.get("NO_MONGO", str(args.no_mongo)).lower() in (
         "true",
         "1",
         "yes",
@@ -592,7 +602,12 @@ def main():
     )
     db_name = os.environ.get("DB_NAME", config.get("db_name", "ci_crawler"))
 
-    token_pool = MongoTokenPool(mongo_uri, db_name)
+    if NO_MONGO:
+        logger.info("Using InMemoryTokenPool (NO_MONGO=True)")
+        token_pool = InMemoryTokenPool()
+    else:
+        logger.info(f"Using MongoTokenPool at {mongo_uri}")
+        token_pool = MongoTokenPool(mongo_uri, db_name)
 
     # Load tokens from Env Var (comma separated) or Config
     tokens_env = os.environ.get("GITHUB_TOKENS", "")
