@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 def load_config(config_path):
     logger.info(f"Loading config from {config_path}")
     try:
-    with open(config_path, "r") as f:
-        cfg = yaml.safe_load(f)
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
 
         logger.debug(
             f"Loaded config keys: {list(cfg.keys()) if isinstance(cfg, dict) else 'N/A'}"
