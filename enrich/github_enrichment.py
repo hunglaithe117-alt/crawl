@@ -11,7 +11,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from datetime import datetime, timedelta
-import gcsfs
+
 
 # Add parent directory to path to import github_api_client and token_pool
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -28,14 +28,8 @@ logger = logging.getLogger(__name__)
 def load_config(config_path):
     logger.info(f"Loading config from {config_path}")
     try:
-        # Support GCS path
-        if config_path.startswith("gs://"):
-            fs = gcsfs.GCSFileSystem()
-            with fs.open(config_path, "r") as f:
-                cfg = yaml.safe_load(f)
-        else:
-            with open(config_path, "r") as f:
-                cfg = yaml.safe_load(f)
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
 
         logger.debug(
             f"Loaded config keys: {list(cfg.keys()) if isinstance(cfg, dict) else 'N/A'}"
@@ -494,13 +488,7 @@ def merge_results(output_dir):
     logger.info(f"Starting merge process in {output_dir}")
 
     # List all parquet files
-    if output_dir.startswith("gs://"):
-        fs = gcsfs.GCSFileSystem()
-        # fs.glob returns paths without gs:// prefix usually
-        files = fs.glob(os.path.join(output_dir, "part_*.parquet"))
-        files = [f"gs://{f}" if not f.startswith("gs://") else f for f in files]
-    else:
-        files = glob.glob(os.path.join(output_dir, "part_*.parquet"))
+    files = glob.glob(os.path.join(output_dir, "part_*.parquet"))
 
     if not files:
         logger.warning("No parquet files found to merge.")
@@ -533,11 +521,7 @@ def merge_results(output_dir):
 
         # Output directory for merged files
         merged_dir = os.path.join(output_dir, "merged_results")
-        if output_dir.startswith("gs://"):
-            # GCS doesn't need makedirs
-            pass
-        else:
-            os.makedirs(merged_dir, exist_ok=True)
+        os.makedirs(merged_dir, exist_ok=True)
 
         for project_name, group in tqdm(grouped, desc="Saving Project CSVs"):
             if pd.isna(project_name):
@@ -657,51 +641,21 @@ def main():
     # Check if we have any parquet files
     processed_ids = set()
 
-    if OUTPUT_DIR.startswith("gs://"):
-        fs = gcsfs.GCSFileSystem()
+    parquet_files = glob.glob(os.path.join(OUTPUT_DIR, "part_*.parquet"))
+
+    if parquet_files:
+        logger.info(
+            f"Found {len(parquet_files)} existing parts. Scanning for processed IDs..."
+        )
+        # DuckDB can read all parquet files at once: read_parquet('folder/*.parquet')
         try:
-            # List files in GCS
-            # glob might return full paths like bucket/path/file.parquet
-            parquet_files = fs.glob(os.path.join(OUTPUT_DIR, "part_*.parquet"))
-            if parquet_files:
-                logger.info(
-                    f"Found {len(parquet_files)} existing parts in GCS. Scanning for processed IDs..."
-                )
-                # Use pandas to read GCS files directly
-                dfs = []
-                for pf in parquet_files:
-                    # fs.glob returns path without gs:// prefix usually, but read_parquet needs it or valid url
-                    # gcsfs paths are usually 'bucket/path'. Add gs:// if missing.
-                    path = pf if pf.startswith("gs://") else f"gs://{pf}"
-                    try:
-                        df_ids = pd.read_parquet(path, columns=["tr_build_id"])
-                        dfs.append(df_ids)
-                    except Exception as e:
-                        logger.warning(f"Failed to read {path}: {e}")
-
-                if dfs:
-                    processed_ids_df = pd.concat(dfs)
-                    processed_ids = set(processed_ids_df["tr_build_id"])
-                    logger.info(f"Found {len(processed_ids)} processed rows.")
+            processed_ids_df = con.execute(
+                f"SELECT tr_build_id FROM read_parquet('{os.path.join(OUTPUT_DIR, 'part_*.parquet')}')"
+            ).fetchdf()
+            processed_ids = set(processed_ids_df["tr_build_id"])
+            logger.info(f"Found {len(processed_ids)} processed rows.")
         except Exception as e:
-            logger.warning(f"Could not read existing parquet files from GCS: {e}")
-
-    else:
-        parquet_files = glob.glob(os.path.join(OUTPUT_DIR, "part_*.parquet"))
-
-        if parquet_files:
-            logger.info(
-                f"Found {len(parquet_files)} existing parts. Scanning for processed IDs..."
-            )
-            # DuckDB can read all parquet files at once: read_parquet('folder/*.parquet')
-            try:
-                processed_ids_df = con.execute(
-                    f"SELECT tr_build_id FROM read_parquet('{os.path.join(OUTPUT_DIR, 'part_*.parquet')}')"
-                ).fetchdf()
-                processed_ids = set(processed_ids_df["tr_build_id"])
-                logger.info(f"Found {len(processed_ids)} processed rows.")
-            except Exception as e:
-                logger.warning(f"Could not read existing parquet files: {e}")
+            logger.warning(f"Could not read existing parquet files: {e}")
 
     # Filter source
     df_to_process = df_source[~df_source["tr_build_id"].isin(processed_ids)]
@@ -721,12 +675,9 @@ def main():
         for i in range(0, len(df_to_process), BATCH_SIZE)
     ]
 
-    if OUTPUT_DIR.startswith("gs://"):
-        missing_commits_log_path = os.path.join(OUTPUT_DIR, "missing_commits_log.csv")
-    else:
-        missing_commits_log_path = os.path.join(
-            os.path.dirname(OUTPUT_DIR), "missing_commits_log.csv"
-        )
+    missing_commits_log_path = os.path.join(
+        os.path.dirname(OUTPUT_DIR), "missing_commits_log.csv"
+    )
 
     for i, chunk in tqdm(
         enumerate(chunks), total=total_chunks, desc="Processing Batches"
@@ -752,14 +703,9 @@ def main():
                 try:
                     # Create a DF and save to csv/parquet
                     log_df = pd.DataFrame(logs, columns=["log_entry"])
-                    # If GCS, use string buffer or just pandas
-                    if OUTPUT_DIR.startswith("gs://"):
-                        # pandas to_csv supports gs://
-                        log_df.to_csv(batch_log_path, index=False, header=False)
-                    else:
-                        with open(missing_commits_log_path, "a") as f:
-                            for log in logs:
-                                f.write(log + "\n")
+                    with open(missing_commits_log_path, "a") as f:
+                        for log in logs:
+                            f.write(log + "\n")
                 except Exception as e:
                     logger.error(f"Failed to write logs: {e}")
 
