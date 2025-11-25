@@ -4,9 +4,6 @@
 mongo_uri: "mongodb://localhost:27017"
 db_name: "ci_crawler"
 
-github_tokens: [] # optional list of GitHub tokens to seed into MongoDB
-min_builds: 50
-
 request_timeout: 30
 request_delay_seconds: 0.1
 retry_count: 3
