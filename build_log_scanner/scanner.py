@@ -14,13 +14,14 @@ import requests
 
 from .config import ScannerConfig, load_config
 from .store import ScanStore
-from ..token_pool import (
+
+from token_pool import (
     MongoTokenPool,
     InMemoryTokenPool,
     TokenPool,
     GitHubTokenPoolAdapter,
 )
-from ..github_api_client import GitHubAPIClient
+from github_api_client import GitHubAPIClient
 
 LOGGER = logging.getLogger(__name__)
 LOG_REQUESTS = False
@@ -421,7 +422,7 @@ def evaluate_github_actions(
 
     while builds_ok < cfg.min_builds:
         url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
-        client = _create_github_client(pool)
+        client = _create_github_client(cfg, pool, owner, repo)
         try:
             resp = client.request(
                 url,

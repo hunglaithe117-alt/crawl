@@ -1,5 +1,5 @@
 [project]
-name = "ci-crawler"
+name = "crawler"
 version = "0.1.0"
 description = "Continuous crawler for GitHub Actions/Travis CI with Mongo-backed token pool"
 requires-python = ">=3.10"
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-ci-crawler = "build_log_scanner.scanner:main"
+crawler = "build_log_scanner.scanner:main"
 
 [tool.uv]
 # Add dev-dependencies here if needed, e.g. "pytest>=7.4"

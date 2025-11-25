@@ -1,5 +1,0 @@
-duckdb
-pyarrow
-pandas
-tqdm
-pyyaml
