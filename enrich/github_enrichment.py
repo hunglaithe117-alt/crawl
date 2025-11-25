@@ -260,7 +260,7 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
                         for f in commit["files"]:
                             touched_files.add(f["filename"])
                 else:
-                    missing_log = f"{row.get('tr_build_id', '')},{row.get('gh_project_name', '')},{sha},Commit not found"
+                    return None, None
             except Exception as e:
                 logger.error(f"Error fetching commit {sha}: {e}")
 
@@ -409,7 +409,7 @@ def process_project_group(
         # 2. Commit Features
         unique_commits = group["git_trigger_commit"].unique()
         logger.info(
-            f"[{project_name}] Found {len(unique_commits)} unique Commits to fetch"
+            f"[{project_name}] Found {len(unique_commits)} unique commits to fetch"
         )
         commit_features_cache = {}
 
@@ -438,6 +438,8 @@ def process_project_group(
             commit_sha = future_to_sha[future]
             try:
                 feats, log = future.result()
+                if feats is None:
+                    continue
                 commit_features_cache[commit_sha] = feats
                 if log:
                     missing_logs.append(log)
