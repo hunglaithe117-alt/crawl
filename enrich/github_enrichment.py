@@ -484,6 +484,7 @@ def process_batch(batch_df, config, token_pool_adapter, repos_dir):
 def merge_results(output_dir):
     """
     Merge all parquet files in output_dir and save as per-project CSVs.
+    Uses DuckDB to process data efficiently without loading everything into memory.
     """
     logger.info(f"Starting merge process in {output_dir}")
 
@@ -494,52 +495,63 @@ def merge_results(output_dir):
         logger.warning("No parquet files found to merge.")
         return
 
-    logger.info(f"Found {len(files)} parquet files. Reading...")
+    logger.info(f"Found {len(files)} parquet files. Processing with DuckDB...")
 
-    # Read all parquet files
-    # If dataset is huge, this might OOM.
-    # Better approach for huge data: Use DuckDB to aggregate and write.
     try:
         # Use DuckDB to read and group
         con = duckdb.connect(database=":memory:")
 
-        # Create a view of all parquet files
-        # DuckDB supports reading list of files or glob
-        # For GCS, we might need to register httpfs/gcsfs if not implicit,
-        # but pandas read is safer for now if we don't want to deal with duckdb extensions in docker.
-        # Let's stick to pandas for simplicity if memory allows (500k rows is fine for 4GB RAM).
+        # Register the parquet files as a view
+        # We use a glob pattern to let DuckDB handle the file reading
+        parquet_pattern = os.path.join(output_dir, "part_*.parquet")
+        con.execute(
+            f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet('{parquet_pattern}')"
+        )
 
-        dfs = []
-        for f in tqdm(files, desc="Reading Parquet"):
-            dfs.append(pd.read_parquet(f))
-
-        full_df = pd.concat(dfs, ignore_index=True)
-        logger.info(f"Total rows loaded: {len(full_df)}")
-
-        # Group by project
-        grouped = full_df.groupby("gh_project_name")
+        # Get distinct project names
+        logger.info("Querying distinct project names...")
+        projects = con.execute(
+            "SELECT DISTINCT gh_project_name FROM all_data WHERE gh_project_name IS NOT NULL"
+        ).fetchall()
+        projects = [p[0] for p in projects]
+        logger.info(f"Found {len(projects)} projects to merge.")
 
         # Output directory for merged files
         merged_dir = os.path.join(output_dir, "merged_results")
         os.makedirs(merged_dir, exist_ok=True)
 
-        for project_name, group in tqdm(grouped, desc="Saving Project CSVs"):
-            if pd.isna(project_name):
-                continue
-
+        for project_name in tqdm(projects, desc="Saving Project CSVs"):
             # Sanitize project name for filename (owner/repo -> owner_repo)
             safe_name = str(project_name).replace("/", "_")
             filename = f"{safe_name}.csv"
             output_path = os.path.join(merged_dir, filename)
 
-            group.to_csv(output_path, index=False)
+            # Use DuckDB COPY to write directly to CSV
+            # This is efficient and avoids loading the result into Python memory
+            logger.debug(f"Exporting {project_name} to {output_path}")
+
+            # Escape single quotes in project name if necessary (though unlikely in GitHub repos)
+            safe_project_name = project_name.replace("'", "''")
+
+            query = f"""
+                COPY (
+                    SELECT * FROM all_data 
+                    WHERE gh_project_name = '{safe_project_name}'
+                ) TO '{output_path}' (HEADER, DELIMITER ',')
+            """
+            con.execute(query)
 
         logger.info(
-            f"Successfully merged and saved {len(grouped)} project CSVs to {merged_dir}"
+            f"Successfully merged and saved {len(projects)} project CSVs to {merged_dir}"
         )
 
     except Exception as e:
         logger.error(f"Merge failed: {e}")
+    finally:
+        try:
+            con.close()
+        except:
+            pass
 
 
 def main():
