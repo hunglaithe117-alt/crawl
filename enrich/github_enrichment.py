@@ -217,37 +217,50 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
 
     # Get trigger commit date for time-based analysis (3 months prior)
     commit_date = None
+    commit_ts = None
     try:
         cmd = ["git", "show", "-s", "--format=%ct", commit_sha]
         ts = subprocess.check_output(
             cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
         ).strip()
         if ts:
-            commit_date = datetime.fromtimestamp(int(ts))
+            commit_ts = int(ts)
+            commit_date = datetime.fromtimestamp(commit_ts)
             logger.debug(f"Commit {commit_sha} date: {commit_date.isoformat()}")
     except Exception:
         pass
 
     touched_files = set()
     build_authors_name = set()
+    built_commits_in_window = 0
+    cutoff_ts = commit_ts - (90 * 24 * 3600) if commit_ts else None
 
     logger.debug(
         f"Commit {commit_sha}: looking up {len(git_all_built_commits)} built commits for touched files"
     )
     for sha in git_all_built_commits:
         try:
-            cmd = ["git", "show", "--name-only", "--format=%an", sha]
+            # Get author, timestamp, and files
+            cmd = ["git", "show", "--name-only", "--format=%an%n%ct", sha]
             output = subprocess.check_output(
                 cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
             ).splitlines()
-            if output:
+            if len(output) >= 2:
                 author_name = output[0]
+                try:
+                    c_ts = int(output[1].strip())
+                    if cutoff_ts is not None and commit_ts is not None:
+                        if cutoff_ts <= c_ts <= commit_ts:
+                            built_commits_in_window += 1
+                except ValueError:
+                    pass
+
                 build_authors_name.add(author_name)
-                for f in output[1:]:
+                for f in output[2:]:
                     if f.strip():
                         touched_files.add(f.strip())
                 logger.debug(
-                    f"Commit {commit_sha}: git show {sha} found author {author_name} and {len(output)-1} files"
+                    f"Commit {commit_sha}: git show {sha} found author {author_name} and {len(output)-2} files lines"
                 )
         except subprocess.CalledProcessError:
             # Fallback to API
@@ -256,6 +269,17 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
                 if commit:
                     if "commit" in commit and "author" in commit["commit"]:
                         build_authors_name.add(commit["commit"]["author"]["name"])
+                        # Check date for window
+                        if cutoff_ts is not None and commit_ts is not None:
+                            c_date_str = commit["commit"]["author"].get("date")
+                            if c_date_str:
+                                try:
+                                    c_ts_api = pd.to_datetime(c_date_str).timestamp()
+                                    if cutoff_ts <= c_ts_api <= commit_ts:
+                                        built_commits_in_window += 1
+                                except Exception:
+                                    pass
+
                     if "files" in commit:
                         for f in commit["files"]:
                             touched_files.add(f["filename"])
@@ -276,6 +300,8 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     if num_touched_files > 0 and "gh_num_commits_on_files_touched" in row:
         commits_on_files = row["gh_num_commits_on_files_touched"]
         if not pd.isna(commits_on_files):
+            # Add built commits in the last 3 months
+            commits_on_files += built_commits_in_window
             features["file_change_frequency"] = commits_on_files / num_touched_files
 
     # Author Ownership
