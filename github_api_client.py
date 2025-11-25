@@ -207,7 +207,7 @@ class GitHubAPIClient:
         return headers
 
     def request(
-        self, url: str, params: Optional[Dict[str, Any]] = None
+        self, url: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any
     ) -> requests.Response:
         """
         Make a GitHub API request with automatic rate limit handling.
@@ -235,11 +235,17 @@ class GitHubAPIClient:
                 time.sleep(wait_for)
 
             try:
+                # Merge headers from kwargs if present
+                request_headers = self._github_headers(token)
+                if "headers" in kwargs:
+                    request_headers.update(kwargs.pop("headers"))
+
                 response = requests.get(
                     url,
-                    headers=self._github_headers(token),
+                    headers=request_headers,
                     params=params,
-                    timeout=30,
+                    timeout=kwargs.get("timeout", 30),
+                    **{k: v for k, v in kwargs.items() if k != "timeout"},
                 )
             except requests.exceptions.RequestException as e:
                 if retries < max_retries:

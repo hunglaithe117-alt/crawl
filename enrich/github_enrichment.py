@@ -33,6 +33,25 @@ def load_config(config_path):
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f)
 
+        # Load tokens from tokens.yml if it exists and merge
+        BASE_DIR = os.path.dirname(config_path)
+        TOKENS_PATH = os.path.join(BASE_DIR, "tokens.yml")
+        if os.path.exists(TOKENS_PATH):
+            try:
+                with open(TOKENS_PATH, "r") as f_tokens:
+                    tokens_config = yaml.safe_load(f_tokens) or {}
+                    if "github_tokens" in tokens_config:
+                        cfg.setdefault("github_tokens", []).extend(
+                            tokens_config["github_tokens"]
+                        )
+                    if "travis_tokens" in tokens_config:
+                        cfg.setdefault("travis_tokens", []).extend(
+                            tokens_config["travis_tokens"]
+                        )
+                logger.info(f"Loaded and merged tokens from {TOKENS_PATH}")
+            except Exception as e:
+                logger.warning(f"Failed to load tokens from {TOKENS_PATH}: {e}")
+
         logger.debug(
             f"Loaded config keys: {list(cfg.keys()) if isinstance(cfg, dict) else 'N/A'}"
         )
@@ -425,27 +444,66 @@ def process_project_group(
             except Exception as e:
                 logger.error(f"Commit fetch failed: {e}")
 
-        # 3. Apply
+        # 3. Apply (Vectorized)
         applied_pr_features = 0
-        applied_commit_features = 0
-        for index, row in group.iterrows():
-            # Apply PR features
-            if row["gh_is_pr"] and not pd.isna(row["gh_pull_req_num"]):
-                pr_num = int(row["gh_pull_req_num"])
-                if pr_num in pr_features_cache:
-                    for k, v in pr_features_cache[pr_num].items():
-                        group.at[index, k] = v
-                    applied_pr_features += 1
+        if pr_features_cache:
+            pr_df = pd.DataFrame.from_dict(pr_features_cache, orient="index")
+            # Ensure index is compatible with gh_pull_req_num (which might be float/int)
+            # We'll map using the index.
 
-            # Apply Commit features
-            commit_sha = row["git_trigger_commit"]
-            if not pd.isna(commit_sha) and commit_sha in commit_features_cache:
-                for k, v in commit_features_cache[commit_sha].items():
-                    group.at[index, k] = v
-                applied_commit_features += 1
+            # Create a temporary series for mapping to handle potential float/int mismatch
+            # We cast the key column in group to numeric, fillna, convert to int for mapping
+            # But simpler: just ensure pr_df index matches what's in gh_pull_req_num (floats if NaN exists)
+
+            # Actually, safest is to map on the values we know are keys.
+            # group['gh_pull_req_num'] has NaNs.
+
+            # Let's use a temporary column for mapping key
+            group["_tmp_pr_key"] = group["gh_pull_req_num"].fillna(-1).astype(int)
+
+            for col in pr_df.columns:
+                # Map values from pr_df to group
+                # pr_df index is int (pr_num)
+                mapped = group["_tmp_pr_key"].map(pr_df[col])
+
+                # Only update where we have a match (mapped is not NaN) AND it's a PR row
+                # But map will return NaN if key not found.
+                # We should only update if row['gh_is_pr'] is True?
+                # The cache only contains PRs we fetched.
+
+                # Update group[col]
+                # We use combine_first to keep existing non-null values if any (though usually they are null)
+                # Or just direct assignment where not null?
+                # group[col] = group[col].fillna(mapped) # This fills NaNs in group with mapped values
+
+                # Let's use update or fillna. Since we initialized cols to None, fillna is good.
+                if col not in group.columns:
+                    group[col] = None
+                group[col] = group[col].fillna(mapped)
+
+            # Count how many rows got updated (approximate, based on one column like gh_num_reviewers)
+            if "gh_num_reviewers" in pr_df.columns:
+                applied_pr_features = group["_tmp_pr_key"].isin(pr_df.index).sum()
+
+            group.drop(columns=["_tmp_pr_key"], inplace=True)
+
+        applied_commit_features = 0
+        if commit_features_cache:
+            commit_df = pd.DataFrame.from_dict(commit_features_cache, orient="index")
+
+            for col in commit_df.columns:
+                mapped = group["git_trigger_commit"].map(commit_df[col])
+                if col not in group.columns:
+                    group[col] = None
+                group[col] = group[col].fillna(mapped)
+
+            # Count applied
+            applied_commit_features = (
+                group["git_trigger_commit"].isin(commit_df.index).sum()
+            )
 
         logger.info(
-            f"[{project_name}] Applied PR features: {applied_pr_features}, Commit features: {applied_commit_features}"
+            f"[{project_name}] Applied PR features: {applied_pr_features} (rows), Commit features: {applied_commit_features} (rows)"
         )
         return group, missing_logs
 
@@ -513,42 +571,22 @@ def merge_results(output_dir):
             f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet('{parquet_pattern}')"
         )
 
-        # Get distinct project names
-        logger.info("Querying distinct project names...")
-        projects = con.execute(
-            "SELECT DISTINCT gh_project_name FROM all_data WHERE gh_project_name IS NOT NULL"
-        ).fetchall()
-        projects = [p[0] for p in projects]
-        logger.info(f"Found {len(projects)} projects to merge.")
-
         # Output directory for merged files
         merged_dir = os.path.join(output_dir, "merged_results")
         os.makedirs(merged_dir, exist_ok=True)
 
-        for project_name in tqdm(projects, desc="Saving Project CSVs"):
-            # Sanitize project name for filename (owner/repo -> owner_repo)
-            safe_name = str(project_name).replace("/", "_")
-            filename = f"{safe_name}.csv"
-            output_path = os.path.join(merged_dir, filename)
+        output_path = os.path.join(merged_dir, "all_enriched_data.csv")
+        logger.info(f"Exporting all data to {output_path}")
 
-            # Use DuckDB COPY to write directly to CSV
-            # This is efficient and avoids loading the result into Python memory
-            logger.debug(f"Exporting {project_name} to {output_path}")
+        # Use DuckDB COPY to write directly to CSV
+        query = f"""
+            COPY (
+                SELECT * FROM all_data 
+            ) TO '{output_path}' (HEADER, DELIMITER ',')
+        """
+        con.execute(query)
 
-            # Escape single quotes in project name if necessary (though unlikely in GitHub repos)
-            safe_project_name = project_name.replace("'", "''")
-
-            query = f"""
-                COPY (
-                    SELECT * FROM all_data 
-                    WHERE gh_project_name = '{safe_project_name}'
-                ) TO '{output_path}' (HEADER, DELIMITER ',')
-            """
-            con.execute(query)
-
-        logger.info(
-            f"Successfully merged and saved {len(projects)} project CSVs to {merged_dir}"
-        )
+        logger.info(f"Successfully merged and saved all data to {output_path}")
 
     except Exception as e:
         logger.error(f"Merge failed: {e}")
@@ -621,7 +659,9 @@ def main():
 
     if NO_MONGO:
         logger.info("Using InMemoryTokenPool (NO_MONGO=True)")
-        token_pool = InMemoryTokenPool()
+        # Check for token file env var
+        token_file = os.environ.get("TOKEN_FILE", "tokens.txt")
+        token_pool = InMemoryTokenPool(token_file=token_file)
     else:
         logger.info(f"Using MongoTokenPool at {mongo_uri}")
         token_pool = MongoTokenPool(mongo_uri, db_name)
@@ -718,6 +758,10 @@ def main():
         ):
             logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
             try:
+                # Reload tokens if using InMemoryTokenPool
+                if isinstance(token_pool, InMemoryTokenPool):
+                    token_pool.reload_from_file()
+
                 # Process
                 df_enriched, logs = process_batch(
                     chunk.copy(), config, pool_adapter, repos_dir, executor

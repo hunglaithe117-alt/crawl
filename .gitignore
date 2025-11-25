@@ -34,6 +34,6 @@ Thumbs.db
 *.log
 
 # Local secrets/config
-github_tokens.yml
-github_tokens.yml
 crawler_config.yml
+build_log_scanner/scanner_config.yml
+tokens.yml

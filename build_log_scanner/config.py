@@ -25,7 +25,9 @@ class ScannerConfig:
     search_per_page: int = 50
     search_pages: int = 1
     min_stars: int = 50
-    search_segments: List[dict] = field(default_factory=list)  # list of {"from": "...", "to": "..."} date strings
+    search_segments: List[dict] = field(
+        default_factory=list
+    )  # list of {"from": "...", "to": "..."} date strings
     segment_start: str = ""  # optional YYYY-MM-DD
     segment_end: str = ""  # optional YYYY-MM-DD
     updated_since: str = "2025-11-01"  # YYYY-MM-DD
@@ -61,6 +63,18 @@ def load_config(path: Path) -> ScannerConfig:
     Only keys present in `ScannerConfig` are applied.
     """
     raw = _read_yaml(path)
+
+    # Load tokens from tokens.yml if it exists in the same directory or parent
+    tokens_path = path.parent / "tokens.yml"
+    if not tokens_path.exists():
+        tokens_path = path.parent.parent / "tokens.yml"
+
+    if tokens_path.exists():
+        tokens_data = _read_yaml(tokens_path)
+        if "github_tokens" in tokens_data:
+            raw.setdefault("github_tokens", []).extend(tokens_data["github_tokens"])
+        if "travis_tokens" in tokens_data:
+            raw.setdefault("travis_tokens", []).extend(tokens_data["travis_tokens"])
     cfg = ScannerConfig()
     for key, value in raw.items():
         if not hasattr(cfg, key):
@@ -70,8 +84,12 @@ def load_config(path: Path) -> ScannerConfig:
             for seg in value:
                 start = end = ""
                 if isinstance(seg, dict):
-                    start = str(seg.get("from") or seg.get("start") or seg.get("from_") or "").strip()
-                    end = str(seg.get("to") or seg.get("end") or seg.get("to_") or "").strip()
+                    start = str(
+                        seg.get("from") or seg.get("start") or seg.get("from_") or ""
+                    ).strip()
+                    end = str(
+                        seg.get("to") or seg.get("end") or seg.get("to_") or ""
+                    ).strip()
                 elif isinstance(seg, Sequence) and len(seg) >= 2:
                     start = str(seg[0]).strip()
                     end = str(seg[1]).strip()

@@ -19,10 +19,6 @@ segment_end: "2024-11-30"
 # Or provide explicit segments; leave empty to use start/end above.
 search_segments: []
 
-# Tokens (leave empty to rely on env vars or manual add/remove)
-github_tokens: []
-travis_tokens: []
-
 # Build/log requirements
 min_builds: 30
 sleep_on_429_seconds: 300

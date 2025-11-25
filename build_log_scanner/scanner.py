@@ -14,7 +14,13 @@ import requests
 
 from .config import ScannerConfig, load_config
 from .store import ScanStore
-from ..token_pool import MongoTokenPool, InMemoryTokenPool, TokenPool
+from ..token_pool import (
+    MongoTokenPool,
+    InMemoryTokenPool,
+    TokenPool,
+    GitHubTokenPoolAdapter,
+)
+from ..github_api_client import GitHubAPIClient
 
 LOGGER = logging.getLogger(__name__)
 LOG_REQUESTS = False
@@ -27,11 +33,15 @@ def _is_human_actor(actor: Optional[Dict[str, Any]]) -> bool:
     login = str(actor.get("login") or "").lower()
     actor_type = (actor.get("type") or "").lower()
     if actor_type == "user":
-        return not (login.endswith("[bot]") or login.endswith("-bot") or login.endswith("bot"))
+        return not (
+            login.endswith("[bot]") or login.endswith("-bot") or login.endswith("bot")
+        )
     if actor_type == "bot":
         return False
     # Fallback heuristic on login
-    return not (login.endswith("[bot]") or login.endswith("-bot") or login.endswith("bot"))
+    return not (
+        login.endswith("[bot]") or login.endswith("-bot") or login.endswith("bot")
+    )
 
 
 def _github_headers(token: Optional[str]) -> Dict[str, str]:
@@ -57,115 +67,22 @@ def _travis_headers(
     return headers
 
 
-def github_request_with_pool(
-    url: str,
-    pool: TokenPool,
+def _create_github_client(
     cfg: ScannerConfig,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, str]] = None,
-    allow_redirects: bool = True,
-    stream: bool = False,
-) -> Tuple[requests.Response, Optional[str]]:
-    """GitHub-only GET with token pool, retries, and rate-limit handling."""
-    attempts = 0
-    while True:
-        token, wait_for = pool.acquire("github")
-        if wait_for > 0:
-            LOGGER.info("All github tokens cooling down for %.1fs", wait_for)
-            time.sleep(wait_for)
-
-        hdrs = {**_github_headers(token), **(headers or {})}
-        try:
-            response = requests.get(
-                url,
-                headers=hdrs,
-                params=params,
-                allow_redirects=allow_redirects,
-                timeout=cfg.request_timeout,
-                stream=stream,
-            )
-            if LOG_REQUESTS:
-                LOGGER.info(
-                    "HTTP GET %s params=%s -> %s %s",
-                    url,
-                    params or {},
-                    response.status_code,
-                    response.text[:100],
-                )
-        except requests.RequestException as exc:
-            attempts += 1
-            if attempts > cfg.retry_count:
-                raise
-            backoff = cfg.retry_base_delay_seconds * (2 ** (attempts - 1))
-            LOGGER.warning(
-                "GitHub request error (%s). Retry %s/%s in %.1fs",
-                exc,
-                attempts,
-                cfg.retry_count,
-                backoff,
-            )
-            time.sleep(backoff)
-            continue
-
-        if response.status_code == 429:
-            retry_after = response.headers.get("Retry-After")
-            wait_seconds = cfg.sleep_on_429_seconds
-            if retry_after and retry_after.isdigit():
-                wait_seconds = max(float(retry_after), 1.0)
-            if token:
-                pool.cooloff("github", token, wait_seconds)
-            LOGGER.warning(
-                "429 from %s; token on cool-down for %.1fs", url, wait_seconds
-            )
-            continue
-
-        if 400 <= response.status_code < 500:
-            body_text = ""
-            try:
-                body = response.json()
-                body_text = str(body)
-            except Exception:
-                body_text = response.text
-            if "spammy" in body_text.lower():
-                if token:
-                    pool.disable_token("github", token)
-                    LOGGER.warning(
-                        "GitHub token %s flagged as spammy; rotating to next token.",
-                        token,
-                    )
-                    if not pool.has_tokens("github"):
-                        LOGGER.warning(
-                            "All GitHub tokens were flagged as spammy; no usable token remains."
-                        )
-                    continue
-                LOGGER.warning(
-                    "GitHub request flagged as spammy with no usable tokens available."
-                )
-            return response, token
-
-        if 500 <= response.status_code < 600:
-            attempts += 1
-            if attempts > cfg.retry_count:
-                return response, token
-            backoff = cfg.retry_base_delay_seconds * (2 ** (attempts - 1))
-            LOGGER.warning(
-                "GitHub server error %s from %s. Retry %s/%s in %.1fs",
-                response.status_code,
-                url,
-                attempts,
-                cfg.retry_count,
-                backoff,
-            )
-            time.sleep(backoff)
-            continue
-
-        remaining = int(response.headers.get("X-RateLimit-Remaining", "1") or 1)
-        reset_ts = response.headers.get("X-RateLimit-Reset")
-        if remaining == 0 and reset_ts and token:
-            pool.mark_rate_limited("github", token, int(reset_ts))
-        time.sleep(cfg.request_delay_seconds)
-        return response, token
+    pool: TokenPool,
+    owner: str = "placeholder",
+    repo: str = "placeholder",
+) -> GitHubAPIClient:
+    """Create a GitHubAPIClient with the shared token pool."""
+    # We use the adapter to make our MongoTokenPool compatible with GitHubAPIClient
+    adapter = GitHubTokenPoolAdapter(pool)
+    return GitHubAPIClient(
+        owner=owner,
+        repo=repo,
+        token_pool=adapter,
+        retry_count=cfg.retry_count,
+        retry_delay=cfg.retry_base_delay_seconds,
+    )
 
 
 def travis_request_with_pool(
@@ -291,7 +208,14 @@ def search_repositories(
                     "per_page": cfg.search_per_page,
                     "page": page,
                 }
-                response, _ = github_request_with_pool(base, pool, cfg, params=params)
+                client = _create_github_client(cfg, pool)
+                try:
+                    response = client.request(
+                        base, params=params, timeout=cfg.request_timeout
+                    )
+                except Exception as e:
+                    LOGGER.warning("Search request failed: %s", e)
+                    break
                 if response.status_code == 422:
                     LOGGER.warning(
                         "Search failed 422 for language=%s page=%s segment=%s..%s: %s",
@@ -337,7 +261,13 @@ def _fetch_content_exists(
     owner: str, repo: str, path: str, cfg: ScannerConfig, pool: TokenPool
 ) -> bool:
     url = f"{cfg.github_api_url.rstrip('/')}/repos/{owner}/{repo}/contents/{path.lstrip('/')}"
-    response, _ = github_request_with_pool(url, pool, cfg, allow_redirects=False)
+    client = _create_github_client(cfg, pool, owner, repo)
+    try:
+        response = client.request(
+            url, allow_redirects=False, timeout=cfg.request_timeout
+        )
+    except Exception:
+        return False
     return response.status_code == 200
 
 
@@ -348,8 +278,16 @@ def detect_ci(
     providers: List[str] = []
 
     runs_url = f"{cfg.github_api_url.rstrip('/')}/repos/{owner}/{repo}/actions/runs"
-    resp, _ = github_request_with_pool(runs_url, pool, cfg, params={"per_page": 1})
-    if resp.status_code == 200 and resp.json().get("total_count", 0) > 0:
+    client = _create_github_client(cfg, pool, owner, repo)
+    try:
+        resp = client.request(
+            runs_url, params={"per_page": 1}, timeout=cfg.request_timeout
+        )
+    except Exception:
+        # If request fails, assume no Actions or error
+        resp = None
+
+    if resp and resp.status_code == 200 and resp.json().get("total_count", 0) > 0:
         providers.append("github_actions")
 
     if _fetch_content_exists(owner, repo, ".travis.yml", cfg, pool):
@@ -370,25 +308,32 @@ def fetch_github_log_with_rules(
     Returns: ok|gone|auth|error
     """
     accept_header = "application/vnd.github+json"
-    resp, _ = github_request_with_pool(
-        url,
-        pool,
-        cfg,
-        headers={"Accept": accept_header},
-        allow_redirects=False,
-    )
+    client = _create_github_client(cfg, pool)
+    try:
+        resp = client.request(
+            url,
+            headers={"Accept": accept_header},
+            allow_redirects=False,
+            timeout=cfg.request_timeout,
+        )
+    except Exception as e:
+        LOGGER.warning("Failed to fetch GitHub log initial: %s", e)
+        return "error"
     if resp.status_code == 302:
         location = resp.headers.get("Location")
         if not location:
             return "error"
-        follow, _ = github_request_with_pool(
-            location,
-            pool,
-            cfg,
-            headers={"Accept": accept_header},
-            allow_redirects=True,
-            stream=False,
-        )
+        try:
+            follow = client.request(
+                location,
+                headers={"Accept": accept_header},
+                allow_redirects=True,
+                stream=False,
+                timeout=cfg.request_timeout,
+            )
+        except Exception as e:
+            LOGGER.warning("Failed to follow GitHub log redirect: %s", e)
+            return "error"
         return "ok" if follow.status_code == 200 else "error"
     if resp.status_code == 200:
         return "ok"
@@ -469,16 +414,27 @@ def evaluate_github_actions(
     owner: str, repo: str, cfg: ScannerConfig, pool: MongoTokenPool
 ) -> Tuple[str, Dict[str, Any]]:
     """Collect GitHub Actions runs until min_builds or until logs disappear."""
-    base_url = f"{cfg.github_api_url.rstrip('/')}/repos/{owner}/{repo}/actions/runs"
     builds_ok = 0
     page = 1
+    consecutive_errors = 0
+    MAX_CONSECUTIVE_ERRORS = 10
+
     while builds_ok < cfg.min_builds:
-        resp, _ = github_request_with_pool(
-            base_url,
-            pool,
-            cfg,
-            params={"per_page": 50, "page": page, "status": "completed"},
-        )
+        url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
+        client = _create_github_client(pool)
+        try:
+            resp = client.request(
+                url,
+                params={"per_page": 50, "page": page, "status": "completed"},
+                timeout=30,
+            )
+        except Exception as e:
+            LOGGER.warning("GitHub Actions list failed: %s", e)
+            return "error", {
+                "builds_found": builds_ok,
+                "message": f"Failed to list runs: {e}",
+            }
+
         if resp.status_code == 404:
             return "missing_actions", {
                 "builds_found": builds_ok,
@@ -493,6 +449,11 @@ def evaluate_github_actions(
         data = resp.json()
         runs = data.get("workflow_runs", [])
         if not runs:
+            if page == 1:
+                return "missing_actions", {
+                    "builds_found": builds_ok,
+                    "message": "Actions disabled or no runs found.",
+                }
             break
 
         LOGGER.info(
@@ -520,6 +481,7 @@ def evaluate_github_actions(
             status = fetch_github_log_with_rules(log_url, cfg, pool)
             if status == "ok":
                 builds_ok += 1
+                consecutive_errors = 0  # Reset on success
                 LOGGER.info(
                     "GitHub Actions log OK for %s/%s run %s (total_ok=%s)",
                     owner,
@@ -528,15 +490,36 @@ def evaluate_github_actions(
                     builds_ok,
                 )
             elif status == "gone":
-                return "logs_gone", {
-                    "builds_found": builds_ok,
-                    "message": "Logs removed (404), stop scanning.",
-                }
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    LOGGER.warning(
+                        "Too many consecutive 410/Gone errors (%d) for %s/%s. Skipping repo.",
+                        consecutive_errors,
+                        owner,
+                        repo,
+                    )
+                    return "logs_gone", {
+                        "builds_found": builds_ok,
+                        "message": f"Logs removed (404) consecutively {consecutive_errors} times, stop scanning.",
+                    }
             elif status == "auth":
                 return "auth_failed", {
                     "builds_found": builds_ok,
                     "message": "401/403 fetching logs.",
                 }
+            elif status == "error":
+                consecutive_errors += 1
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                    LOGGER.warning(
+                        "Too many consecutive errors (%d) for %s/%s. Skipping repo.",
+                        consecutive_errors,
+                        owner,
+                        repo,
+                    )
+                    return "error", {
+                        "builds_found": builds_ok,
+                        "message": f"Too many consecutive errors {consecutive_errors}, stop scanning.",
+                    }
 
             if builds_ok >= cfg.min_builds:
                 break

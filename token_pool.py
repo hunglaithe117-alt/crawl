@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Tuple, Protocol, Dict, List, Optional, Any
 import threading
 import time
+import os
 
 from pymongo import MongoClient, ReturnDocument
 from pymongo.collection import Collection
@@ -19,7 +20,9 @@ class TokenPool(Protocol):
     def acquire(self, token_type: str) -> Tuple[Optional[str], float]: ...
     def cooloff(self, token_type: str, token: str, seconds: float) -> None: ...
     def disable_token(self, token_type: str, token: str) -> None: ...
-    def mark_rate_limited(self, token_type: str, token: Optional[str], reset_epoch: int) -> None: ...
+    def mark_rate_limited(
+        self, token_type: str, token: Optional[str], reset_epoch: int
+    ) -> None: ...
     def has_tokens(self, token_type: str) -> bool: ...
     def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None: ...
     def add_token(self, token_type: str, token: str, enable: bool = True) -> bool: ...
@@ -61,7 +64,9 @@ class MongoTokenPool:
     - last_used: datetime for round-robin ordering
     """
 
-    def __init__(self, mongo_uri: str, db_name: str, collection: str = "tokens") -> None:
+    def __init__(
+        self, mongo_uri: str, db_name: str, collection: str = "tokens"
+    ) -> None:
         self.client = MongoClient(mongo_uri)
         self.collection: Collection = self.client[db_name][collection]
         try:
@@ -78,7 +83,9 @@ class MongoTokenPool:
 
     def _ensure_indexes(self) -> None:
         self.collection.create_index([("type", 1), ("token", 1)], unique=True)
-        self.collection.create_index([("type", 1), ("disabled", 1), ("cooldown_until", 1)])
+        self.collection.create_index(
+            [("type", 1), ("disabled", 1), ("cooldown_until", 1)]
+        )
 
     def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None:
         """Idempotently add a list of tokens into the pool."""
@@ -96,7 +103,9 @@ class MongoTokenPool:
             result = self.collection.update_one(
                 {"type": token_type, "token": token},
                 {
-                    "$setOnInsert": {"last_used": datetime.fromtimestamp(0, tz=timezone.utc)},
+                    "$setOnInsert": {
+                        "last_used": datetime.fromtimestamp(0, tz=timezone.utc)
+                    },
                     "$set": {
                         "disabled": not enable,
                         "cooldown_until": datetime.fromtimestamp(0, tz=timezone.utc),
@@ -125,7 +134,9 @@ class MongoTokenPool:
         result = self.collection.delete_one({"type": token_type, "token": token})
         return result.deleted_count > 0
 
-    def mark_rate_limited(self, token_type: str, token: Optional[str], reset_epoch: int) -> None:
+    def mark_rate_limited(
+        self, token_type: str, token: Optional[str], reset_epoch: int
+    ) -> None:
         """Mark token as unavailable until the given epoch seconds."""
         query = {"type": token_type, "token": token}
         update: Dict[str, Any] = {
@@ -134,12 +145,12 @@ class MongoTokenPool:
                 "updated_at": datetime.now(timezone.utc),
             }
         }
-        
+
         if token is None:
             # Upsert for anonymous token
             update["$setOnInsert"] = {
                 "disabled": False,
-                "last_used": datetime.fromtimestamp(0, tz=timezone.utc)
+                "last_used": datetime.fromtimestamp(0, tz=timezone.utc),
             }
             self.collection.update_one(query, update, upsert=True)
         else:
@@ -150,7 +161,12 @@ class MongoTokenPool:
         until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         self.collection.update_one(
             {"type": token_type, "token": token},
-            {"$set": {"cooldown_until": until, "updated_at": datetime.now(timezone.utc)}},
+            {
+                "$set": {
+                    "cooldown_until": until,
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            },
         )
 
     def acquire(self, token_type: str) -> Tuple[str | None, float]:
@@ -186,7 +202,9 @@ class MongoTokenPool:
         return None, 0.0
 
     def has_tokens(self, token_type: str) -> bool:
-        return self.collection.count_documents({"type": token_type, "disabled": False}) > 0
+        return (
+            self.collection.count_documents({"type": token_type, "disabled": False}) > 0
+        )
 
     def next_ready_in(self, token_type: str) -> float:
         now = datetime.now(timezone.utc)
@@ -204,11 +222,43 @@ class InMemoryTokenPool:
     In-memory token rotation (non-persistent).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, token_file: Optional[str] = None) -> None:
         # {token_type: [{token: str, disabled: bool, cooldown_until: float, last_used: float}]}
         self._store: Dict[str, List[Dict[str, Any]]] = {}
         self._anonymous_state: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        self.token_file = token_file
+        if self.token_file:
+            self.reload_from_file()
+
+    def reload_from_file(self) -> None:
+        """Reload tokens from the configured token file."""
+        if not self.token_file or not os.path.exists(self.token_file):
+            return
+
+        try:
+            with open(self.token_file, "r") as f:
+                lines = f.readlines()
+
+            # Simple format: token_string (assumes github type for now, or format type:token)
+            # Let's assume just tokens for github for simplicity as per requirement
+            for line in lines:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                # Check if type is specified "type:token"
+                if ":" in line:
+                    parts = line.split(":", 1)
+                    t_type, t_token = parts[0], parts[1]
+                else:
+                    t_type, t_token = "github", line
+
+                self.add_token(t_type, t_token)
+
+            LOGGER.info(f"Reloaded tokens from {self.token_file}")
+        except Exception as e:
+            LOGGER.error(f"Failed to reload tokens from file: {e}")
 
     def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None:
         for token in tokens:
@@ -221,20 +271,22 @@ class InMemoryTokenPool:
         with self._lock:
             if token_type not in self._store:
                 self._store[token_type] = []
-            
+
             # Check if exists
             for item in self._store[token_type]:
                 if item["token"] == token:
                     item["disabled"] = not enable
                     item["cooldown_until"] = 0.0
                     return False
-            
-            self._store[token_type].append({
-                "token": token,
-                "disabled": not enable,
-                "cooldown_until": 0.0,
-                "last_used": 0.0
-            })
+
+            self._store[token_type].append(
+                {
+                    "token": token,
+                    "disabled": not enable,
+                    "cooldown_until": 0.0,
+                    "last_used": 0.0,
+                }
+            )
             return True
 
     def disable_token(self, token_type: str, token: str) -> None:
@@ -250,10 +302,14 @@ class InMemoryTokenPool:
             if token_type not in self._store:
                 return False
             initial_len = len(self._store[token_type])
-            self._store[token_type] = [t for t in self._store[token_type] if t["token"] != token]
+            self._store[token_type] = [
+                t for t in self._store[token_type] if t["token"] != token
+            ]
             return len(self._store[token_type]) < initial_len
 
-    def mark_rate_limited(self, token_type: str, token: Optional[str], reset_epoch: int) -> None:
+    def mark_rate_limited(
+        self, token_type: str, token: Optional[str], reset_epoch: int
+    ) -> None:
         with self._lock:
             if token is None:
                 if token_type not in self._anonymous_state:
@@ -282,8 +338,7 @@ class InMemoryTokenPool:
             items = self._store.get(token_type, [])
             # Filter usable
             candidates = [
-                t for t in items 
-                if not t["disabled"] and t["cooldown_until"] <= now
+                t for t in items if not t["disabled"] and t["cooldown_until"] <= now
             ]
             if candidates:
                 # Sort by last_used to round-robin
@@ -291,24 +346,23 @@ class InMemoryTokenPool:
                 chosen = candidates[0]
                 chosen["last_used"] = now
                 return chosen["token"], 0.0
-            
+
             # If we have tokens but none are ready
             if items:
                 waiting = [
-                    t for t in items 
-                    if not t["disabled"] and t["cooldown_until"] > now
+                    t for t in items if not t["disabled"] and t["cooldown_until"] > now
                 ]
                 if waiting:
                     min_wait = min(t["cooldown_until"] for t in waiting) - now
                     return None, max(min_wait, 0.0)
                 return None, 0.0
-            
+
             # No tokens configured, check anonymous
             anon_state = self._anonymous_state.get(token_type, {})
             anon_cooldown = anon_state.get("cooldown_until", 0.0)
             if anon_cooldown > now:
                 return None, anon_cooldown - now
-            
+
             return None, 0.0
 
     def has_tokens(self, token_type: str) -> bool:
@@ -321,8 +375,7 @@ class InMemoryTokenPool:
         with self._lock:
             items = self._store.get(token_type, [])
             waiting = [
-                t for t in items 
-                if not t["disabled"] and t["cooldown_until"] > now
+                t for t in items if not t["disabled"] and t["cooldown_until"] > now
             ]
             if waiting:
                 return max(min(t["cooldown_until"] for t in waiting) - now, 0.0)
