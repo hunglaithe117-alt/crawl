@@ -14,7 +14,7 @@ search_per_page: 100
 search_pages: 10
 
 # Optional: auto-generate weekly created-date segments between these dates (YYYY-MM-DD).
-segment_start: "2018-11-24"
+segment_start: "2018-12-01"
 segment_end: "2024-11-30"
 # Or provide explicit segments; leave empty to use start/end above.
 search_segments: []

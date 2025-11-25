@@ -197,7 +197,11 @@ class MongoTokenPool:
             sort=[("cooldown_until", 1)],
         )
         if waiting and waiting.get("cooldown_until"):
-            wait_seconds = max((waiting["cooldown_until"] - now).total_seconds(), 0.0)
+            cooldown = waiting["cooldown_until"]
+            # Ensure cooldown is offset-aware (UTC) if it comes back naive from Mongo
+            if cooldown.tzinfo is None:
+                cooldown = cooldown.replace(tzinfo=timezone.utc)
+            wait_seconds = max((cooldown - now).total_seconds(), 0.0)
             return None, wait_seconds
         return None, 0.0
 
