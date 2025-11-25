@@ -1,0 +1,18 @@
+# Default configuration for ci-crawler. Copy/adjust as needed.
+# Values here override environment variable defaults.
+
+mongo_uri: "mongodb://localhost:27017"
+db_name: "ci_crawler"
+
+github_tokens: [] # optional list of GitHub tokens to seed into MongoDB
+min_builds: 50
+
+request_timeout: 30
+request_delay_seconds: 0.1
+retry_count: 3
+retry_base_delay_seconds: 0.1
+
+github_api_retry_count: 5
+github_api_retry_delay: 1.0
+
+github_api_url: "https://api.github.com"

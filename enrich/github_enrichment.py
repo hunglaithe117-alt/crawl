@@ -790,8 +790,9 @@ def main():
         os.path.dirname(OUTPUT_DIR), "missing_commits_log.csv"
     )
 
+    max_workers = config.get("max_workers", 5)
     # Use a shared executor for all batches to avoid creating/destroying threads repeatedly
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for i, chunk in tqdm(
             enumerate(chunks), total=total_chunks, desc="Processing Batches"
         ):
