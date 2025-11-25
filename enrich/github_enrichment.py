@@ -358,7 +358,7 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
 
 
 def process_project_group(
-    project_name, group, config, token_pool_adapter, repos_dir, executor
+    project_name, group, config, token_pool_adapter, repos_dir, executor, cleanup=True
 ):
     """
     Process a group of rows belonging to the same project.
@@ -512,7 +512,7 @@ def process_project_group(
 
     finally:
         # Cleanup repo to save space
-        if os.path.exists(repo_dir):
+        if cleanup and os.path.exists(repo_dir):
             try:
                 shutil.rmtree(repo_dir)
                 logger.info(f"[{project_name}] Cleaned up repo at {repo_dir}")
@@ -522,7 +522,9 @@ def process_project_group(
                 )
 
 
-def process_batch(batch_df, config, token_pool_adapter, repos_dir, executor):
+def process_batch(
+    batch_df, config, token_pool_adapter, repos_dir, executor, projects_to_keep=None
+):
     logger.info(f"Processing batch: rows={len(batch_df)}")
     # Group by project within the batch
     grouped = batch_df.groupby("gh_project_name")
@@ -537,9 +539,17 @@ def process_batch(batch_df, config, token_pool_adapter, repos_dir, executor):
     # Process each project in the batch
     # We could parallelize this loop too, but let's keep it simple:
     # Parallelism is inside process_project_group (fetching PRs/Commits).
+    projects_to_keep = projects_to_keep or set()
     for project_name, group in grouped:
+        should_cleanup = project_name not in projects_to_keep
         processed_group, logs = process_project_group(
-            project_name, group.copy(), config, token_pool_adapter, repos_dir, executor
+            project_name,
+            group.copy(),
+            config,
+            token_pool_adapter,
+            repos_dir,
+            executor,
+            cleanup=should_cleanup,
         )
         results.append(processed_group)
         all_missing_logs.extend(logs)
@@ -765,9 +775,19 @@ def main():
                 if isinstance(token_pool, InMemoryTokenPool):
                     token_pool.reload_from_file()
 
+                # Determine projects to keep for the next batch
+                next_batch_projects = set()
+                if i + 1 < len(chunks):
+                    next_batch_projects = set(chunks[i + 1]["gh_project_name"].unique())
+
                 # Process
                 df_enriched, logs = process_batch(
-                    chunk.copy(), config, pool_adapter, repos_dir, executor
+                    chunk.copy(),
+                    config,
+                    pool_adapter,
+                    repos_dir,
+                    executor,
+                    projects_to_keep=next_batch_projects,
                 )
 
                 # Save logs
