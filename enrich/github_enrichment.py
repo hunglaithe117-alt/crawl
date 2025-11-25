@@ -10,7 +10,9 @@ import glob
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from tqdm import tqdm
 from datetime import datetime, timedelta
+import shutil
 
 
 # Add parent directory to path to import github_api_client and token_pool
@@ -335,12 +337,11 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
 # --- Pipeline Logic ---
 
 
-def process_project_group(project_name, group, config, token_pool_adapter, repos_dir):
+def process_project_group(
+    project_name, group, config, token_pool_adapter, repos_dir, executor
+):
     """
     Process a group of rows belonging to the same project.
-    This runs inside a thread or process, but since we use ThreadPool for API calls,
-    we might want to run this sequentially per project to avoid git lock issues,
-    or use a lock for git operations.
     """
     if pd.isna(project_name):
         return group, []
@@ -359,21 +360,16 @@ def process_project_group(project_name, group, config, token_pool_adapter, repos
     repo_url = f"https://github.com/{project_name}.git"
     repo_dir = os.path.join(repos_dir, f"{owner}_{repo}")
 
-    # Clone repo (Thread-safe check needed if multiple threads access same repo?
-    # But we group by project, so one thread per project usually.
-    # If we have multiple batches processing same project, we might have issues.
-    # Ideally, we sort input by project so batches are contiguous.)
-    clone_repo(repo_url, repo_dir)
+    try:
+        clone_repo(repo_url, repo_dir)
 
-    missing_logs = []
+        missing_logs = []
 
-    # 1. PR Features
-    unique_prs = group[group["gh_is_pr"]]["gh_pull_req_num"].unique()
-    logger.info(f"[{project_name}] Found {len(unique_prs)} unique PRs to fetch")
-    pr_features_cache = {}
+        # 1. PR Features
+        unique_prs = group[group["gh_is_pr"]]["gh_pull_req_num"].unique()
+        logger.info(f"[{project_name}] Found {len(unique_prs)} unique PRs to fetch")
+        pr_features_cache = {}
 
-    # We can parallelize PR fetching here
-    with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_pr = {
             executor.submit(
                 get_pr_features,
@@ -391,15 +387,13 @@ def process_project_group(project_name, group, config, token_pool_adapter, repos
             except Exception as e:
                 logger.error(f"PR fetch failed: {e}")
 
-    # 2. Commit Features
-    unique_commits = group["git_trigger_commit"].unique()
-    logger.info(f"[{project_name}] Found {len(unique_commits)} unique Commits to fetch")
-    commit_features_cache = {}
+        # 2. Commit Features
+        unique_commits = group["git_trigger_commit"].unique()
+        logger.info(
+            f"[{project_name}] Found {len(unique_commits)} unique Commits to fetch"
+        )
+        commit_features_cache = {}
 
-    # We can parallelize Commit fetching here
-    # Note: git operations in get_commit_features might conflict if running in parallel on same repo?
-    # git show is read-only, should be fine.
-    with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_sha = {}
         for commit_sha in unique_commits:
             if pd.isna(commit_sha):
@@ -431,32 +425,43 @@ def process_project_group(project_name, group, config, token_pool_adapter, repos
             except Exception as e:
                 logger.error(f"Commit fetch failed: {e}")
 
-    # 3. Apply
-    applied_pr_features = 0
-    applied_commit_features = 0
-    for index, row in group.iterrows():
-        # Apply PR features
-        if row["gh_is_pr"] and not pd.isna(row["gh_pull_req_num"]):
-            pr_num = int(row["gh_pull_req_num"])
-            if pr_num in pr_features_cache:
-                for k, v in pr_features_cache[pr_num].items():
+        # 3. Apply
+        applied_pr_features = 0
+        applied_commit_features = 0
+        for index, row in group.iterrows():
+            # Apply PR features
+            if row["gh_is_pr"] and not pd.isna(row["gh_pull_req_num"]):
+                pr_num = int(row["gh_pull_req_num"])
+                if pr_num in pr_features_cache:
+                    for k, v in pr_features_cache[pr_num].items():
+                        group.at[index, k] = v
+                    applied_pr_features += 1
+
+            # Apply Commit features
+            commit_sha = row["git_trigger_commit"]
+            if not pd.isna(commit_sha) and commit_sha in commit_features_cache:
+                for k, v in commit_features_cache[commit_sha].items():
                     group.at[index, k] = v
-                applied_pr_features += 1
+                applied_commit_features += 1
 
-        # Apply Commit features
-        commit_sha = row["git_trigger_commit"]
-        if not pd.isna(commit_sha) and commit_sha in commit_features_cache:
-            for k, v in commit_features_cache[commit_sha].items():
-                group.at[index, k] = v
-            applied_commit_features += 1
+        logger.info(
+            f"[{project_name}] Applied PR features: {applied_pr_features}, Commit features: {applied_commit_features}"
+        )
+        return group, missing_logs
 
-    logger.info(
-        f"[{project_name}] Applied PR features: {applied_pr_features}, Commit features: {applied_commit_features}"
-    )
-    return group, missing_logs
+    finally:
+        # Cleanup repo to save space
+        if os.path.exists(repo_dir):
+            try:
+                shutil.rmtree(repo_dir)
+                logger.info(f"[{project_name}] Cleaned up repo at {repo_dir}")
+            except Exception as e:
+                logger.warning(
+                    f"[{project_name}] Failed to cleanup repo at {repo_dir}: {e}"
+                )
 
 
-def process_batch(batch_df, config, token_pool_adapter, repos_dir):
+def process_batch(batch_df, config, token_pool_adapter, repos_dir, executor):
     logger.info(f"Processing batch: rows={len(batch_df)}")
     # Group by project within the batch
     grouped = batch_df.groupby("gh_project_name")
@@ -473,7 +478,7 @@ def process_batch(batch_df, config, token_pool_adapter, repos_dir):
     # Parallelism is inside process_project_group (fetching PRs/Commits).
     for project_name, group in grouped:
         processed_group, logs = process_project_group(
-            project_name, group.copy(), config, token_pool_adapter, repos_dir
+            project_name, group.copy(), config, token_pool_adapter, repos_dir, executor
         )
         results.append(processed_group)
         all_missing_logs.extend(logs)
@@ -706,49 +711,47 @@ def main():
         os.path.dirname(OUTPUT_DIR), "missing_commits_log.csv"
     )
 
-    for i, chunk in tqdm(
-        enumerate(chunks), total=total_chunks, desc="Processing Batches"
-    ):
-        logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
-        try:
-            # Process
-            df_enriched, logs = process_batch(
-                chunk.copy(), config, pool_adapter, repos_dir
-            )
-
-            # Save logs
-            if logs:
-                # Append to log file. For GCS, appending is hard. We might just write a new log file per batch?
-                # Or just log to stdout/stderr since Cloud Logging captures it.
-                # But user wants a file.
-                # Let's write a batch-specific log file to avoid concurrency issues/appending issues on GCS.
-                batch_log_filename = (
-                    f"missing_commits_log_{int(datetime.now().timestamp())}_{i}.csv"
+    # Use a shared executor for all batches to avoid creating/destroying threads repeatedly
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        for i, chunk in tqdm(
+            enumerate(chunks), total=total_chunks, desc="Processing Batches"
+        ):
+            logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
+            try:
+                # Process
+                df_enriched, logs = process_batch(
+                    chunk.copy(), config, pool_adapter, repos_dir, executor
                 )
-                batch_log_path = os.path.join(OUTPUT_DIR, batch_log_filename)
 
-                try:
-                    # Create a DF and save to csv/parquet
-                    log_df = pd.DataFrame(logs, columns=["log_entry"])
-                    with open(missing_commits_log_path, "a") as f:
-                        for log in logs:
-                            f.write(log + "\n")
-                except Exception as e:
-                    logger.error(f"Failed to write logs: {e}")
+                # Save logs
+                if logs:
+                    batch_log_filename = (
+                        f"missing_commits_log_{int(datetime.now().timestamp())}_{i}.csv"
+                    )
+                    batch_log_path = os.path.join(OUTPUT_DIR, batch_log_filename)
 
-            # Save Batch to Parquet
-            # Use a timestamp or batch index in filename
-            batch_filename = f"part_{int(datetime.now().timestamp())}_{i}.parquet"
-            output_path = os.path.join(OUTPUT_DIR, batch_filename)
-            df_enriched.to_parquet(output_path, index=False)
-            logger.info(
-                f"Saved batch {i+1} file {output_path} (rows={len(df_enriched)})"
-            )
+                    try:
+                        # Create a DF and save to csv/parquet
+                        log_df = pd.DataFrame(logs, columns=["log_entry"])
+                        with open(missing_commits_log_path, "a") as f:
+                            for log in logs:
+                                f.write(log + "\n")
+                    except Exception as e:
+                        logger.error(f"Failed to write logs: {e}")
 
-        except Exception as e:
-            logger.error(f"Error processing batch {i}: {e}")
-            # Continue to next batch? Yes.
-            continue
+                # Save Batch to Parquet
+                # Use a timestamp or batch index in filename
+                batch_filename = f"part_{int(datetime.now().timestamp())}_{i}.parquet"
+                output_path = os.path.join(OUTPUT_DIR, batch_filename)
+                df_enriched.to_parquet(output_path, index=False)
+                logger.info(
+                    f"Saved batch {i+1} file {output_path} (rows={len(df_enriched)})"
+                )
+
+            except Exception as e:
+                logger.error(f"Error processing batch {i}: {e}")
+                # Continue to next batch? Yes.
+                continue
 
     if ENABLE_MERGE:
         merge_results(OUTPUT_DIR)
