@@ -19,9 +19,29 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from github_api_client import GitHubAPIClient
 from token_pool import TokenManager
 
+class TqdmLoggingHandler(logging.Handler):
+    """Logging handler that writes messages through tqdm to avoid interfering with the progress bar."""
+
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Use tqdm.write which writes to stderr but keeps progress bar state intact
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
 # Setup logging
+# Use a tqdm-aware handler and force override existing logging config (eg. uvicorn)
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[TqdmLoggingHandler()],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -569,7 +589,7 @@ def process_project_group(
                 # Let's use update or fillna. Since we initialized cols to None, fillna is good.
                 if col not in group.columns:
                     group[col] = None
-                group[col] = group[col].fillna(mapped)
+                group[col] = group[col].fillna(mapped).infer_objects(copy=False)
 
             # Count how many rows got updated (approximate, based on one column like gh_num_reviewers)
             if "gh_num_reviewers" in pr_df.columns:
@@ -585,7 +605,7 @@ def process_project_group(
                 mapped = group["git_trigger_commit"].map(commit_df[col])
                 if col not in group.columns:
                     group[col] = None
-                group[col] = group[col].fillna(mapped)
+                group[col] = group[col].fillna(mapped).infer_objects(copy=False)
 
             # Count applied
             applied_commit_features = (
@@ -718,6 +738,12 @@ def main():
         "--repos-dir", default="/tmp/repos_risk", help="Temp dir for repos"
     )
     parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level",
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help="Merge results into per-project CSVs at the end",
@@ -729,6 +755,18 @@ def main():
     OUTPUT_DIR = args.output_dir
     BATCH_SIZE = args.batch_size
     ENABLE_MERGE = args.merge
+
+    # Set logging level from args (helps debugging during runs with many outputs)
+    try:
+        level = getattr(logging, args.log_level.upper(), logging.INFO)
+        logging.getLogger().setLevel(level)
+        logger.debug(f"Logging level set to {args.log_level}")
+        # Diagnostic: report active handlers
+        active_handlers = [type(h).__name__ for h in logging.getLogger().handlers]
+        logger.info(f"Active logging handlers: {active_handlers}")
+    except Exception:
+        # Keep previous logger settings
+        pass
 
     if not INPUT_CSV or not OUTPUT_DIR:
         logger.error("INPUT_FILE and OUTPUT_DIR must be provided via args.")

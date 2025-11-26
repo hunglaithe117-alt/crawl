@@ -15,16 +15,50 @@ import requests
 from .config import ScannerConfig, load_config
 from .store import ScanStore
 
-from token_pool import (
-    MongoTokenPool,
-    InMemoryTokenPool,
-    TokenPool,
-    GitHubTokenPoolAdapter,
-)
+from token_pool import Token, TokenManager, MongoTokenManager
 from github_api_client import GitHubAPIClient
 
 LOGGER = logging.getLogger(__name__)
 LOG_REQUESTS = False
+
+
+def _init_token_manager(
+    tokens: Optional[List[str]],
+    cfg: ScannerConfig,
+    *,
+    collection_name: str,
+    token_type: str,
+    allow_empty: bool = False,
+) -> Optional[TokenManager]:
+    """
+    Initialize a TokenManager or MongoTokenManager based on configuration.
+
+    If Mongo is available, tokens are seeded into the specified collection.
+    When allow_empty is True and no tokens are provided and Mongo init fails,
+    returns None instead of raising.
+    """
+    cleaned_tokens = [str(t).strip() for t in tokens or [] if str(t).strip()]
+
+    try:
+        manager = MongoTokenManager(cfg.mongo_uri, cfg.db_name, collection_name)
+        for token in cleaned_tokens:
+            manager.add_token(token_type, token)
+        return manager
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to init MongoTokenManager for %s (%s). Falling back to memory.",
+            collection_name,
+            exc,
+        )
+
+    if not cleaned_tokens:
+        if allow_empty:
+            return None
+        raise RuntimeError(
+            f"No tokens configured for {token_type} and MongoDB is unavailable."
+        )
+
+    return TokenManager(cleaned_tokens)
 
 
 def _is_human_actor(actor: Optional[Dict[str, Any]]) -> bool:
@@ -70,42 +104,46 @@ def _travis_headers(
 
 def _create_github_client(
     cfg: ScannerConfig,
-    pool: TokenPool,
+    token_manager: Optional[TokenManager],
     owner: str = "placeholder",
     repo: str = "placeholder",
 ) -> GitHubAPIClient:
-    """Create a GitHubAPIClient with the shared token pool."""
-    # We use the adapter to make our MongoTokenPool compatible with GitHubAPIClient
-    adapter = GitHubTokenPoolAdapter(pool)
+    """Create a GitHubAPIClient with the shared token manager."""
     return GitHubAPIClient(
         owner=owner,
         repo=repo,
-        token_pool=adapter,
+        token_manager=token_manager,
         retry_count=cfg.retry_count,
         retry_delay=cfg.retry_base_delay_seconds,
     )
 
 
-def travis_request_with_pool(
+def travis_request_with_manager(
     url: str,
-    pool: TokenPool,
+    token_manager: Optional[TokenManager],
     cfg: ScannerConfig,
     *,
     headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
     allow_redirects: bool = True,
     stream: bool = False,
 ) -> Tuple[requests.Response, Optional[str]]:
-    """Travis-only GET with token pool and retries."""
+    """Travis-only GET with token manager and retries."""
     attempts = 0
     while True:
-        token, wait_for = pool.acquire("travis")
-        if wait_for > 0:
-            LOGGER.info("All travis tokens cooling down for %.1fs", wait_for)
-            time.sleep(wait_for)
+        token_obj: Optional[Token] = None
+        if token_manager:
+            try:
+                token_obj = token_manager.get_best_token()
+            except Exception as exc:
+                LOGGER.error("Failed to acquire Travis token: %s", exc)
+                raise
 
         hdrs = {
-            **_travis_headers(token, (headers or {}).get("Accept", "application/json")),
+            **_travis_headers(
+                token_obj.key if token_obj else None,
+                (headers or {}).get("Accept", "application/json"),
+            ),
             **(headers or {}),
         }
         try:
@@ -142,19 +180,23 @@ def travis_request_with_pool(
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
             wait_seconds = cfg.sleep_on_429_seconds
-            if retry_after and retry_after.isdigit():
-                wait_seconds = max(float(retry_after), 1.0)
-            if token:
-                pool.cooloff("travis", token, wait_seconds)
+            if retry_after:
+                try:
+                    wait_seconds = max(float(retry_after), 1.0)
+                except ValueError:
+                    pass
+            if token_manager and token_obj:
+                token_manager.handle_rate_limit(token_obj)
             LOGGER.warning(
                 "429 from %s; token on cool-down for %.1fs", url, wait_seconds
             )
+            time.sleep(wait_seconds)
             continue
 
         if 500 <= response.status_code < 600:
             attempts += 1
             if attempts > cfg.retry_count:
-                return response, token
+                return response, token_obj.key if token_obj else None
             backoff = cfg.retry_base_delay_seconds * (2 ** (attempts - 1))
             LOGGER.warning(
                 "Travis server error %s from %s. Retry %s/%s in %.1fs",
@@ -167,12 +209,18 @@ def travis_request_with_pool(
             time.sleep(backoff)
             continue
 
+        if token_manager and token_obj:
+            try:
+                token_manager.update_token(token_obj, response.headers)
+            except Exception:
+                pass
+
         time.sleep(cfg.request_delay_seconds)
-        return response, token
+        return response, token_obj.key if token_obj else None
 
 
 def search_repositories(
-    cfg: ScannerConfig, pool: TokenPool
+    cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> Iterable[Dict[str, Any]]:
     """Yield repositories that match the configured filters, per-language (no OR)."""
     base = f"{cfg.github_api_url.rstrip('/')}/search/repositories"
@@ -209,7 +257,7 @@ def search_repositories(
                     "per_page": cfg.search_per_page,
                     "page": page,
                 }
-                client = _create_github_client(cfg, pool)
+                client = _create_github_client(cfg, token_manager)
                 try:
                     response = client.request(
                         base, params=params, timeout=cfg.request_timeout
@@ -259,10 +307,14 @@ def search_repositories(
 
 
 def _fetch_content_exists(
-    owner: str, repo: str, path: str, cfg: ScannerConfig, pool: TokenPool
+    owner: str,
+    repo: str,
+    path: str,
+    cfg: ScannerConfig,
+    token_manager: Optional[TokenManager],
 ) -> bool:
     url = f"{cfg.github_api_url.rstrip('/')}/repos/{owner}/{repo}/contents/{path.lstrip('/')}"
-    client = _create_github_client(cfg, pool, owner, repo)
+    client = _create_github_client(cfg, token_manager, owner, repo)
     try:
         response = client.request(
             url, allow_redirects=False, timeout=cfg.request_timeout
@@ -273,13 +325,13 @@ def _fetch_content_exists(
 
 
 def detect_ci(
-    owner: str, repo: str, cfg: ScannerConfig, pool: MongoTokenPool
+    owner: str, repo: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> List[str]:
     """Detect whether the repo uses GitHub Actions and/or Travis CI."""
     providers: List[str] = []
 
     runs_url = f"{cfg.github_api_url.rstrip('/')}/repos/{owner}/{repo}/actions/runs"
-    client = _create_github_client(cfg, pool, owner, repo)
+    client = _create_github_client(cfg, token_manager, owner, repo)
     try:
         resp = client.request(
             runs_url, params={"per_page": 1}, timeout=cfg.request_timeout
@@ -291,7 +343,7 @@ def detect_ci(
     if resp and resp.status_code == 200 and resp.json().get("total_count", 0) > 0:
         providers.append("github_actions")
 
-    if _fetch_content_exists(owner, repo, ".travis.yml", cfg, pool):
+    if _fetch_content_exists(owner, repo, ".travis.yml", cfg, token_manager):
         providers.append("travis_ci")
 
     LOGGER.info(
@@ -301,7 +353,7 @@ def detect_ci(
 
 
 def fetch_github_log_with_rules(
-    url: str, cfg: ScannerConfig, pool: MongoTokenPool
+    url: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> str:
     """
     Fetch a GitHub Actions log respecting 302/404/401/403/5xx/429 rules.
@@ -309,7 +361,7 @@ def fetch_github_log_with_rules(
     Returns: ok|gone|auth|error
     """
     accept_header = "application/vnd.github+json"
-    client = _create_github_client(cfg, pool)
+    client = _create_github_client(cfg, token_manager)
     try:
         resp = client.request(
             url,
@@ -373,16 +425,16 @@ def fetch_github_log_with_rules(
 
 
 def fetch_travis_log_with_rules(
-    url: str, cfg: ScannerConfig, pool: MongoTokenPool
+    url: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> str:
     """
     Fetch a Travis log respecting 302/404/401/403/5xx/429 rules.
 
     Returns: ok|gone|auth|error
     """
-    resp, _ = travis_request_with_pool(
+    resp, _ = travis_request_with_manager(
         url,
-        pool,
+        token_manager,
         cfg,
         headers={"Accept": "text/plain"},
         allow_redirects=False,
@@ -391,9 +443,9 @@ def fetch_travis_log_with_rules(
         location = resp.headers.get("Location")
         if not location:
             return "error"
-        follow, _ = travis_request_with_pool(
+        follow, _ = travis_request_with_manager(
             location,
-            pool,
+            token_manager,
             cfg,
             headers={"Accept": "text/plain"},
             allow_redirects=True,
@@ -412,7 +464,7 @@ def fetch_travis_log_with_rules(
 
 
 def evaluate_github_actions(
-    owner: str, repo: str, cfg: ScannerConfig, pool: MongoTokenPool
+    owner: str, repo: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> Tuple[str, Dict[str, Any]]:
     """Collect GitHub Actions runs until min_builds or until logs disappear."""
     builds_ok = 0
@@ -422,7 +474,7 @@ def evaluate_github_actions(
 
     while builds_ok < cfg.min_builds:
         url = f"https://api.github.com/repos/{owner}/{repo}/actions/runs"
-        client = _create_github_client(cfg, pool, owner, repo)
+        client = _create_github_client(cfg, token_manager, owner, repo)
         try:
             resp = client.request(
                 url,
@@ -479,7 +531,7 @@ def evaluate_github_actions(
                     (actor or {}).get("login"),
                 )
                 continue
-            status = fetch_github_log_with_rules(log_url, cfg, pool)
+            status = fetch_github_log_with_rules(log_url, cfg, token_manager)
             if status == "ok":
                 builds_ok += 1
                 consecutive_errors = 0  # Reset on success
@@ -539,13 +591,13 @@ def evaluate_github_actions(
 
 
 def _travis_builds(
-    owner: str, repo: str, cfg: ScannerConfig, pool: MongoTokenPool
+    owner: str, repo: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> List[Dict[str, Any]]:
     slug = f"{owner}%2F{repo}"
     url = f"{cfg.travis_api_url.rstrip('/')}/repo/{slug}/builds"
-    resp, _ = travis_request_with_pool(
+    resp, _ = travis_request_with_manager(
         url,
-        pool,
+        token_manager,
         cfg,
         params={"limit": 50, "sort_by": "started_at:desc", "include": "build.jobs"},
     )
@@ -568,10 +620,10 @@ def _travis_job_ids(build: Dict[str, Any]) -> List[int]:
 
 
 def evaluate_travis(
-    owner: str, repo: str, cfg: ScannerConfig, pool: MongoTokenPool
+    owner: str, repo: str, cfg: ScannerConfig, token_manager: Optional[TokenManager]
 ) -> Tuple[str, Dict[str, Any]]:
     """Collect Travis job logs until min_builds or until logs disappear."""
-    builds = _travis_builds(owner, repo, cfg, pool)
+    builds = _travis_builds(owner, repo, cfg, token_manager)
     if not builds:
         return "missing_travis", {
             "builds_found": 0,
@@ -582,7 +634,7 @@ def evaluate_travis(
     for build in builds:
         for job_id in _travis_job_ids(build):
             log_url = f"{cfg.travis_api_url.rstrip('/')}/job/{job_id}/log"
-            status = fetch_travis_log_with_rules(log_url, cfg, pool)
+            status = fetch_travis_log_with_rules(log_url, cfg, token_manager)
             if status == "ok":
                 builds_ok += 1
                 LOGGER.info(
@@ -619,14 +671,18 @@ def evaluate_travis(
 
 
 def scan_repository(
-    repo: Dict[str, Any], cfg: ScannerConfig, pool: MongoTokenPool, store: ScanStore
+    repo: Dict[str, Any],
+    cfg: ScannerConfig,
+    github_tokens: Optional[TokenManager],
+    travis_tokens: Optional[TokenManager],
+    store: ScanStore,
 ) -> None:
     owner, name = repo["full_name"].split("/", 1)
     LOGGER.info("Scanning repo %s", repo["full_name"])
     if store.seen_any(repo["full_name"]):
         LOGGER.info("Skipping %s (already processed)", repo["full_name"])
         return
-    providers = detect_ci(owner, name, cfg, pool)
+    providers = detect_ci(owner, name, cfg, github_tokens)
     LOGGER.info(
         "Detected CI providers for %s: %s", repo["full_name"], providers or "<none>"
     )
@@ -650,9 +706,11 @@ def scan_repository(
             continue
 
         if provider == "github_actions":
-            status, details = evaluate_github_actions(owner, name, cfg, pool)
+            status, details = evaluate_github_actions(
+                owner, name, cfg, github_tokens
+            )
         else:
-            status, details = evaluate_travis(owner, name, cfg, pool)
+            status, details = evaluate_travis(owner, name, cfg, travis_tokens)
 
         payload = {**repo_details, **details, "provider": provider}
         store.upsert(repo["full_name"], provider, status, payload)
@@ -698,25 +756,25 @@ def parse_args() -> argparse.Namespace:
         "--add-github-token",
         action="append",
         dest="add_github_tokens",
-        help="Add a GitHub token to the Mongo token pool (can be repeated).",
+        help="Add a GitHub token (seeds Mongo if configured). Can be repeated.",
     )
     parser.add_argument(
         "--add-travis-token",
         action="append",
         dest="add_travis_tokens",
-        help="Add a Travis token to the Mongo token pool (can be repeated).",
+        help="Add a Travis token (seeds Mongo if configured). Can be repeated.",
     )
     parser.add_argument(
         "--remove-github-token",
         action="append",
         dest="remove_github_tokens",
-        help="Remove a GitHub token from the Mongo token pool (can be repeated).",
+        help="Remove a GitHub token (Mongo only). Can be repeated.",
     )
     parser.add_argument(
         "--remove-travis-token",
         action="append",
         dest="remove_travis_tokens",
-        help="Remove a Travis token from the Mongo token pool (can be repeated).",
+        help="Remove a Travis token (Mongo only). Can be repeated.",
     )
     parser.add_argument(
         "--verbose", action="store_true", help="Enable INFO-level logging."
@@ -742,23 +800,56 @@ def main() -> None:
     if args.min_builds is not None:
         cfg.min_builds = max(1, args.min_builds)
 
-    pool = MongoTokenPool(cfg.mongo_uri, cfg.db_name)
-    pool.seed_tokens("github", cfg.github_tokens)
-    pool.seed_tokens("travis", cfg.travis_tokens)
+    github_tokens = list(cfg.github_tokens or [])
+    travis_tokens = list(cfg.travis_tokens or [])
 
-    maintenance_performed = False
-    for token in args.add_github_tokens or []:
-        pool.add_token("github", token)
-        maintenance_performed = True
-    for token in args.add_travis_tokens or []:
-        pool.add_token("travis", token)
-        maintenance_performed = True
-    for token in args.remove_github_tokens or []:
-        pool.remove_token("github", token)
-        maintenance_performed = True
-    for token in args.remove_travis_tokens or []:
-        pool.remove_token("travis", token)
-        maintenance_performed = True
+    # Apply CLI token modifications to local lists before manager creation
+    github_tokens.extend(args.add_github_tokens or [])
+    travis_tokens.extend(args.add_travis_tokens or [])
+    if args.remove_github_tokens:
+        to_remove = set(args.remove_github_tokens)
+        github_tokens = [t for t in github_tokens if t not in to_remove]
+    if args.remove_travis_tokens:
+        to_remove = set(args.remove_travis_tokens)
+        travis_tokens = [t for t in travis_tokens if t not in to_remove]
+
+    maintenance_performed = bool(
+        (args.add_github_tokens or args.add_travis_tokens)
+        or (args.remove_github_tokens or args.remove_travis_tokens)
+    )
+
+    try:
+        github_manager = _init_token_manager(
+            github_tokens,
+            cfg,
+            collection_name="github_tokens",
+            token_type="github",
+        )
+    except RuntimeError as exc:
+        LOGGER.error(exc)
+        return
+
+    travis_manager = _init_token_manager(
+        travis_tokens,
+        cfg,
+        collection_name="travis_tokens",
+        token_type="travis",
+        allow_empty=True,
+    )
+
+    # Apply removals to Mongo collections if requested
+    if isinstance(github_manager, MongoTokenManager):
+        for token_str in args.remove_github_tokens or []:
+            try:
+                github_manager.remove_token(Token(token_str))
+            except Exception as exc:
+                LOGGER.warning("Failed to remove GitHub token %s: %s", token_str, exc)
+    if isinstance(travis_manager, MongoTokenManager):
+        for token_str in args.remove_travis_tokens or []:
+            try:
+                travis_manager.remove_token(Token(token_str))
+            except Exception as exc:
+                LOGGER.warning("Failed to remove Travis token %s: %s", token_str, exc)
 
     if maintenance_performed and args.limit is None and args.min_builds is None:
         LOGGER.info("Token maintenance complete; skipping scan.")
@@ -768,13 +859,13 @@ def main() -> None:
 
     def run_once(limit: Optional[int]) -> int:
         count_local = 0
-        for repo in search_repositories(cfg, pool):
+        for repo in search_repositories(cfg, github_manager):
             if limit is not None and count_local >= limit:
                 break
             if store.seen_any(repo.get("full_name", "")):
                 LOGGER.info("Skipping %s (already in DB)", repo.get("full_name"))
                 continue
-            scan_repository(repo, cfg, pool, store)
+            scan_repository(repo, cfg, github_manager, travis_manager, store)
             count_local += 1
         return count_local
 

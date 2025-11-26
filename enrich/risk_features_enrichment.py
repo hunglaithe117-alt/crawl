@@ -24,9 +24,28 @@ except ImportError:
     GitHubAPIClient = None
     TokenManager = None
 
-# Setup logging
+# A small handler that uses tqdm.write to avoid breaking the progress bar
+class TqdmLoggingHandler(logging.Handler):
+    """Logging handler that writes messages through tqdm to avoid interfering with the progress bar."""
+
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+# Setup logging (write via tqdm so it remains visible alongside the progress bar)
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[TqdmLoggingHandler()],
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -126,7 +145,7 @@ def get_build_time(row, repo_dir, commit_sha, client):
     ):
         try:
             build_time = pd.to_datetime(row["gh_build_started_at"])
-        except:
+        except Exception:
             pass
 
     # Priority 3: API Fallback (Usually UTC)
@@ -434,7 +453,7 @@ def process_project_group(
     if cleanup and repo_dir and os.path.exists(repo_dir):
         try:
             shutil.rmtree(repo_dir)
-        except:
+        except Exception:
             pass
 
     return pd.DataFrame(results), missing_logs
@@ -501,7 +520,7 @@ def merge_results(output_dir):
     finally:
         try:
             con.close()
-        except:
+        except Exception:
             pass
 
 
@@ -520,6 +539,12 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--merge", action="store_true", help="Merge results at the end")
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level",
+    )
     args = parser.parse_args()
 
     # Priority: Env Var > Args
@@ -531,6 +556,16 @@ def main():
         "1",
         "yes",
     )
+
+    # Configure runtime logging level based on CLI flag
+    try:
+        level = getattr(logging, args.log_level.upper(), logging.INFO)
+        logging.getLogger().setLevel(level)
+        logger.debug(f"Logging level set to {args.log_level}")
+        active_handlers = [type(h).__name__ for h in logging.getLogger().handlers]
+        logger.info(f"Active logging handlers: {active_handlers}")
+    except Exception:
+        pass
 
     if not INPUT_CSV or not OUTPUT_DIR:
         logger.error("INPUT_FILE and OUTPUT_DIR must be provided via args or env vars.")
