@@ -212,15 +212,26 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
     # Fallback to API
     if is_new_contributor is None and client:
         try:
-            # 1. Get commit author login or email
+            # 1. Get commit author info
             commit_data = client.get_commit(commit_sha)
             if commit_data:
-                author_login = None
-                if "author" in commit_data and commit_data["author"]:
-                    author_login = commit_data["author"].get("login")
+                identifiers = []
 
-                # If we have a login, search for their first commit
-                if author_login:
+                # Collect available identifiers
+                if "author" in commit_data and commit_data["author"]:
+                    login = commit_data["author"].get("login")
+                    if login:
+                        identifiers.append(login)
+
+                if "commit" in commit_data and "author" in commit_data["commit"]:
+                    name = commit_data["commit"]["author"].get("name")
+                    if name:
+                        identifiers.append(name)
+
+                # Remove duplicates and None
+                identifiers = list(set(filter(None, identifiers)))
+
+                if identifiers:
                     cutoff_date = (
                         build_time - timedelta(days=90)
                         if build_time
@@ -228,20 +239,21 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                     )
                     cutoff_str = cutoff_date.isoformat()
 
-                    # Check for commits by author BEFORE cutoff
-                    # GET /repos/.../commits?author=X&until=cutoff&per_page=1
-                    older_commits = client.get_commits(
-                        params={
-                            "author": author_login,
-                            "until": cutoff_str,
-                            "per_page": 1,
-                        }
-                    )
+                    found_older = False
+                    for ident in identifiers:
+                        # Check for commits by identifier BEFORE cutoff
+                        # GET /repos/.../commits?author=X&until=cutoff&per_page=1
+                        older_commits = client.get_commits(
+                            params={"author": ident, "until": cutoff_str, "per_page": 1}
+                        )
+                        if older_commits:
+                            found_older = True
+                            break
 
-                    if older_commits:
+                    if found_older:
                         is_new_contributor = 0  # Found commits older than 90 days
                     else:
-                        # No commits older than 90 days.
+                        # No commits older than 90 days for ANY identifier
                         is_new_contributor = 1
 
         except Exception:
