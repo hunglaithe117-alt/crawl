@@ -168,6 +168,9 @@ def get_risk_features(row, repo_dir, client=None):
                 "Could not determine build time (Git & API failed)",
             )
 
+    if missing_log:
+        return features, missing_log
+
     # 2. Src/Test Churn Ratio
     src_churn = float(row.get("git_diff_src_churn", 0) or 0)
     test_churn = float(row.get("git_diff_test_churn", 0) or 0)
@@ -180,6 +183,8 @@ def get_risk_features(row, repo_dir, client=None):
 
     # 4. Is New Contributor
     is_new_contributor = None
+
+    # Try Git First
     if repo_dir and os.path.exists(repo_dir):
         try:
             cmd = ["git", "show", "-s", "--format=%an", commit_sha]
@@ -214,14 +219,58 @@ def get_risk_features(row, repo_dir, client=None):
         except Exception:
             pass
 
+    # Fallback to API
+    if is_new_contributor is None and client:
+        try:
+            # 1. Get commit author login or email
+            commit_data = client.get_commit(commit_sha)
+            if commit_data:
+                author_login = None
+                if "author" in commit_data and commit_data["author"]:
+                    author_login = commit_data["author"].get("login")
+
+                # If we have a login, search for their first commit
+                if author_login:
+                    cutoff_date = (
+                        build_time - timedelta(days=90)
+                        if build_time
+                        else datetime.now() - timedelta(days=90)
+                    )
+                    cutoff_str = cutoff_date.isoformat()
+
+                    # Check for commits by author BEFORE cutoff
+                    # GET /repos/.../commits?author=X&until=cutoff&per_page=1
+                    older_commits = client.get_commits(
+                        params={
+                            "author": author_login,
+                            "until": cutoff_str,
+                            "per_page": 1,
+                        }
+                    )
+
+                    if older_commits:
+                        is_new_contributor = 0  # Found commits older than 90 days
+                    else:
+                        # No commits older than 90 days.
+                        # Does this mean they are new? Yes, likely.
+                        # (Assuming they have commits *after* cutoff, which they do, since we have the current commit)
+                        is_new_contributor = 1
+
+        except Exception as e:
+            # logger.warning(f"API fallback for is_new_contributor failed: {e}")
+            pass
+
     if is_new_contributor is None:
         if not missing_log:
             missing_log = (
                 build_id,
                 project_name,
                 commit_sha,
-                "Skipped is_new_contributor (No Git History)",
+                "Skipped is_new_contributor (Git & API failed)",
             )
+
+    if missing_log:
+        return features, missing_log
 
     features["is_new_contributor"] = is_new_contributor
 
@@ -233,11 +282,14 @@ def get_risk_features(row, repo_dir, client=None):
         commits_to_scan = [commit_sha]
 
     file_changes_map = {}  # file -> lines changed (add+del)
-    entropy_calculated = False
+    entropy_failed = False
 
-    if repo_dir and os.path.exists(repo_dir):
-        try:
-            for sha in commits_to_scan:
+    for sha in commits_to_scan:
+        commit_processed = False
+
+        # 1. Try Git
+        if repo_dir and os.path.exists(repo_dir):
+            try:
                 cmd_stat = ["git", "show", "--numstat", "--format=", sha]
                 output = subprocess.check_output(
                     cmd_stat, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
@@ -254,13 +306,13 @@ def get_risk_features(row, repo_dir, client=None):
                             )
                         except ValueError:
                             pass
-            entropy_calculated = True
-        except Exception:
-            pass
+                commit_processed = True
+            except Exception:
+                pass
 
-    if not entropy_calculated and client:
-        try:
-            for sha in commits_to_scan:
+        # 2. Fallback to API
+        if not commit_processed and client:
+            try:
                 commit_data = client.get_commit(sha)
                 if commit_data and "files" in commit_data:
                     for f in commit_data["files"]:
@@ -270,17 +322,23 @@ def get_risk_features(row, repo_dir, client=None):
                             file_changes_map[filename] = (
                                 file_changes_map.get(filename, 0) + changes
                             )
-            entropy_calculated = True
-        except Exception as e:
+                    commit_processed = True
+            except Exception as e:
+                # logger.warning(f"API failed for entropy {sha}: {e}")
+                pass
+
+        if not commit_processed:
+            entropy_failed = True
             if not missing_log:
                 missing_log = (
                     build_id,
                     project_name,
-                    commit_sha,
-                    f"Entropy failed: {e}",
+                    sha,
+                    "Entropy failed: Git & API failed",
                 )
+            break  # Stop processing if one commit fails, as entropy will be invalid
 
-    if entropy_calculated:
+    if not entropy_failed:
         changes_list = list(file_changes_map.values())
         features["change_entropy"] = calculate_entropy(changes_list)
     else:
@@ -322,6 +380,7 @@ def process_project_group(
         feats, log = get_risk_features(row, repo_dir, client)
         if log:
             missing_logs.append(log)
+            continue  # Skip this row if enrichment failed
 
         # Merge features into row
         for k, v in feats.items():

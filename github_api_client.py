@@ -400,6 +400,28 @@ class GitHubAPIClient:
             logger.warning("Failed to fetch commit %s from GitHub API: %s", sha, exc)
             return None
 
+    def get_commits(
+        self, params: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch a list of commits from GitHub API.
+
+        Args:
+            params: Query parameters (e.g., {'author': 'username', 'per_page': 1})
+
+        Returns:
+            List of commit objects
+        """
+        try:
+            logger.debug("GET /repos/%s/%s/commits", self.owner, self.repo)
+            commits = self.get(
+                f"/repos/{self.owner}/{self.repo}/commits", params=params
+            )
+            return commits if isinstance(commits, list) else []
+        except Exception as exc:
+            logger.warning("Failed to fetch commits list: %s", exc)
+            return []
+
     def get_repository(self) -> Optional[Dict[str, Any]]:
         """
         Fetch repository metadata from GitHub API.

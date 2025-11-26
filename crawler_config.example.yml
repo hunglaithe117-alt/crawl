@@ -4,6 +4,7 @@
 mongo_uri: "mongodb://localhost:27017"
 db_name: "ci_crawler"
 
+max_workers: 5
 request_timeout: 30
 request_delay_seconds: 0.1
 retry_count: 3
