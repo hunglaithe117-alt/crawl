@@ -574,7 +574,12 @@ def main():
             logger.warning(f"Could not read existing parquet files: {e}")
 
     logger.info(f"Reading {INPUT_CSV}...")
-    df_source = pd.read_csv(INPUT_CSV)
+    # Use DuckDB to read CSV to avoid pandas segfaults on large files
+    try:
+        df_source = duckdb.read_csv(INPUT_CSV).df()
+    except Exception as e:
+        logger.error(f"Failed to read CSV with DuckDB: {e}")
+        sys.exit(1)
 
     # Initialize new columns
     new_cols = [

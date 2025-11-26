@@ -759,7 +759,13 @@ def main():
 
     # 1. Load Source
     logger.info(f"Loading source data from {INPUT_CSV}")
-    df_source = pd.read_csv(INPUT_CSV)
+    # Use DuckDB to read CSV to avoid pandas segfaults on large files
+    try:
+        df_source = duckdb.read_csv(INPUT_CSV).df()
+    except Exception as e:
+        logger.error(f"Failed to read CSV with DuckDB: {e}")
+        sys.exit(1)
+
 
     # Initialize new columns
     new_cols = [
