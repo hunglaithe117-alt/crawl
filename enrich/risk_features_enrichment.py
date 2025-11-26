@@ -105,30 +105,46 @@ def calculate_entropy(file_changes):
 
 def get_build_time(row, repo_dir, commit_sha, client):
     build_time = None
-    if "gh_build_started_at" in row and not pd.isna(row["gh_build_started_at"]):
+
+    # Priority 1: Git (Local Time)
+    if repo_dir and os.path.exists(repo_dir):
+        try:
+            # %ai: author date, ISO 8601-like format (e.g., "2023-10-25 14:30:00 +0700")
+            cmd = ["git", "show", "-s", "--format=%ai", commit_sha]
+            output = subprocess.check_output(
+                cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
+            ).strip()
+            if output:
+                # pandas to_datetime handles ISO 8601 with offsets correctly
+                build_time = pd.to_datetime(output)
+        except Exception:
+            pass
+
+    # Priority 2: CSV (UTC)
+    if (
+        build_time is None
+        and "gh_build_started_at" in row
+        and not pd.isna(row["gh_build_started_at"])
+    ):
         try:
             build_time = pd.to_datetime(row["gh_build_started_at"])
         except:
             pass
 
-    if build_time is None:
-        # Try git
-        if repo_dir:
-            build_time = get_git_commit_date(repo_dir, commit_sha)
+    # Priority 3: API Fallback (Usually UTC)
+    if build_time is None and client:
+        try:
+            commit_data = client.get_commit(commit_sha)
+            if (
+                commit_data
+                and "commit" in commit_data
+                and "author" in commit_data["commit"]
+            ):
+                date_str = commit_data["commit"]["author"]["date"]
+                build_time = pd.to_datetime(date_str)
+        except Exception:
+            pass
 
-        # Fallback to API
-        if build_time is None and client:
-            try:
-                commit_data = client.get_commit(commit_sha)
-                if (
-                    commit_data
-                    and "commit" in commit_data
-                    and "author" in commit_data["commit"]
-                ):
-                    date_str = commit_data["commit"]["author"]["date"]
-                    build_time = pd.to_datetime(date_str)
-            except Exception:
-                pass
     return build_time
 
 
