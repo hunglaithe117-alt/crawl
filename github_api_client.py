@@ -31,10 +31,6 @@ ip_rotator = GCERotator()
 
 
 def check_and_rotate_ip() -> None:
-    """
-    Global function to handle IP rotation.
-    Ensures only one rotation happens at a time and pauses all workers.
-    """
     # Try to acquire lock non-blocking. If locked, rotation is already in progress.
     if rotation_lock.acquire(blocking=False):
         try:
@@ -118,7 +114,10 @@ class GitHubAPIClient:
             "User-Agent": "travistorrent-tools-py",
         }
         if token_key:
-            headers["Authorization"] = f"token {token_key}"
+            if token_key.startswith("github_pat_"):
+                headers["Authorization"] = f"Bearer {token_key}"
+            else:
+                headers["Authorization"] = f"token {token_key}"
         return headers
 
     def _get_cache_path(self, url: str, params: Optional[Dict] = None) -> str:
@@ -214,6 +213,12 @@ class GitHubAPIClient:
                         # But we are inside loop. If we continue, we retry request.
                         # Let's just force a retry without ETag
                         continue
+
+                # Handle Invalid Token (401)
+                if response.status_code == 401:
+                    logger.error(f"🚫 Token {token.key[:4]}... is INVALID (401). Removing from pool.")
+                    self._token_manager.remove_token(token)
+                    continue
 
                 # Handle Rate Limits (403/429)
                 if response.status_code == 429:

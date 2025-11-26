@@ -724,18 +724,14 @@ def main():
     )
     args = parser.parse_args()
 
-    # Priority: Env Var > Args
-    INPUT_CSV = os.environ.get("INPUT_FILE", args.input)
-    OUTPUT_DIR = os.environ.get("OUTPUT_DIR", args.output_dir)
-    BATCH_SIZE = int(os.environ.get("BATCH_SIZE", args.batch_size))
-    ENABLE_MERGE = os.environ.get("ENABLE_MERGE", str(args.merge)).lower() in (
-        "true",
-        "1",
-        "yes",
-    )
+    # Priority: Args only (Env vars removed as requested)
+    INPUT_CSV = args.input
+    OUTPUT_DIR = args.output_dir
+    BATCH_SIZE = args.batch_size
+    ENABLE_MERGE = args.merge
 
     if not INPUT_CSV or not OUTPUT_DIR:
-        logger.error("INPUT_FILE and OUTPUT_DIR must be provided via args or env vars.")
+        logger.error("INPUT_FILE and OUTPUT_DIR must be provided via args.")
         sys.exit(1)
 
     # Ensure output dir exists
@@ -743,19 +739,32 @@ def main():
     os.makedirs(args.repos_dir, exist_ok=True)
 
     # Load Config & Setup Token Pool
-    # Allow CONFIG_PATH env var
-    config_path_env = os.environ.get("CONFIG_PATH", CONFIG_PATH)
-    config = load_config(config_path_env)
+    config = load_config(CONFIG_PATH)
 
-    # Load tokens from Env Var (comma separated) or Config
-    tokens_env = os.environ.get("GITHUB_TOKENS", "")
-    if tokens_env:
-        tokens = [t.strip() for t in tokens_env.split(",") if t.strip()]
+    # Load tokens from Config
+    tokens = config.get("github_tokens", [])
+
+    # Check for Mongo
+    mongo_uri = config.get("mongo_uri")
+
+    if mongo_uri:
+        try:
+            from token_pool import MongoTokenManager
+            db_name = config.get("db_name", "ci_crawler")
+            logger.info(f"Initializing MongoTokenManager with DB {db_name}")
+            token_manager = MongoTokenManager(mongo_uri, db_name)
+            
+            # Seed tokens if provided and not in DB
+            if tokens:
+                logger.info(f"Seeding {len(tokens)} tokens into MongoDB...")
+                for t in tokens:
+                    token_manager.add_token("github", t)
+        except Exception as e:
+            logger.warning(f"Failed to init MongoTokenManager: {e}. Falling back to memory.")
+            token_manager = TokenManager(tokens)
     else:
-        tokens = config.get("github_tokens", [])
-
-    logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
-    token_manager = TokenManager(tokens)
+        logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
+        token_manager = TokenManager(tokens)
 
     # 1. Load Source
     logger.info(f"Loading source data from {INPUT_CSV}")

@@ -27,10 +27,6 @@ class GCERotator:
         return response.text
 
     def rotate_ip(self):
-        """
-        Thực hiện gỡ IP cũ và gắn IP mới.
-        Hàm này sẽ chặn (block) khoảng 10-15s.
-        """
         if not self.instance_name or not self.zone:
             logging.error("❌ Cannot rotate IP: Missing instance metadata.")
             return False
@@ -67,8 +63,8 @@ class GCERotator:
             subprocess.run(cmd_add, check=True, capture_output=True)
             
             # 3. Chờ mạng ổn định (Rất quan trọng)
-            logging.info("IP changed. Waiting 5s for network stabilization...")
-            time.sleep(5) 
+            logging.info("IP changed. Waiting 10s for network stabilization...")
+            time.sleep(10) 
             
             logging.info("✅ IP ROTATION COMPLETED.")
             return True
