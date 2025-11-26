@@ -3,153 +3,67 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+import threading
+import hashlib
+import json
+import os
+from typing import Any, Dict, List, Optional, Sequence
 import requests
+from requests.models import Response
+
+# Try relative import first (for package usage), then absolute
+try:
+    from .token_pool import TokenManager
+    from .gce_rotator import GCERotator
+except ImportError:
+    from token_pool import TokenManager
+    from gce_rotator import GCERotator
 
 logger = logging.getLogger(__name__)
 
+# --- GLOBAL CONTROLS FOR IP ROTATION ---
+# Shared across all GitHubAPIClient instances
+network_ready_event = threading.Event()
+network_ready_event.set()  # Initially ready
+rotation_lock = threading.Lock()
+ip_rotator = GCERotator()
 
-class RateLimitExceeded(Exception):
-    """Raised when GitHub API rate limit is exceeded."""
 
-    pass
+def check_and_rotate_ip() -> None:
+    """
+    Global function to handle IP rotation.
+    Ensures only one rotation happens at a time and pauses all workers.
+    """
+    # Try to acquire lock non-blocking. If locked, rotation is already in progress.
+    if rotation_lock.acquire(blocking=False):
+        try:
+            logger.warning("🚨 DETECTED BLOCK (429). INITIATING IP ROTATION...")
 
+            # 1. Pause all workers
+            network_ready_event.clear()
 
-class GitHubTokenPool:
-    """Rotate GitHub tokens to mitigate API rate limits."""
+            # 2. Perform rotation
+            success = ip_rotator.rotate_ip()
 
-    def __init__(self, tokens: Sequence[str]) -> None:
-        self._lock = threading.Lock()
-        unique_tokens: List[str] = []
-        seen: Set[str] = set()
-        for token in tokens:
-            token = token.strip()
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            unique_tokens.append(token)
-        self._tokens: List[str] = unique_tokens
-        self._next_available: Dict[str, float] = {token: 0.0 for token in self._tokens}
-        self._anonymous_next_available: float = 0.0
-        self._index: int = 0
-
-    @property
-    def tokens(self) -> List[str]:
-        """Get the list of tokens."""
-        with self._lock:
-            return list(self._tokens)
-
-    def add_token(self, token: str) -> bool:
-        """
-        Add a new token to the pool.
-
-        Args:
-            token: The token to add
-
-        Returns:
-            True if the token was added, False if it already exists
-        """
-        token = token.strip()
-        if not token:
-            return False
-
-        with self._lock:
-            if token in self._next_available:
-                return False
-            self._tokens.append(token)
-            self._next_available[token] = 0.0
-            logger.info(f"Added new token to pool. Total tokens: {len(self._tokens)}")
-            return True
-
-    def has_tokens(self) -> bool:
-        """Check if there are any tokens available."""
-        return bool(self._tokens)
-
-    def acquire(self) -> Tuple[Optional[str], float]:
-        """
-        Return a token ready for use and optional wait time in seconds.
-
-        Returns:
-            Tuple of (token, wait_time_seconds)
-        """
-        now = time.time()
-        with self._lock:
-            if not self._tokens:
-                wait = max(self._anonymous_next_available - now, 0.0)
-                return None, wait
-
-            for _ in range(len(self._tokens)):
-                token = self._tokens[self._index]
-                if self._next_available[token] <= now:
-                    return token, 0.0
-                self._advance()
-
-            token = min(
-                self._tokens,
-                key=lambda item: self._next_available.get(item, float("inf")),
-            )
-            wait = max(self._next_available.get(token, now) - now, 0.0)
-            self._index = self._tokens.index(token)
-            return token, wait
-
-    def mark_rate_limited(
-        self, token: Optional[str], reset_epoch: Optional[int]
-    ) -> None:
-        """
-        Mark a token as rate limited until the given reset time.
-
-        Args:
-            token: The token that hit rate limit (or None for anonymous)
-            reset_epoch: Unix timestamp when the rate limit resets
-        """
-        wait_until = float(reset_epoch) if reset_epoch else time.time() + 60.0
-        with self._lock:
-            if token is None:
-                self._anonymous_next_available = wait_until
-                return
-            if token in self._next_available:
-                self._next_available[token] = wait_until
-            self._advance()
-
-    def disable(self, token: Optional[str]) -> None:
-        """
-        Permanently disable a token (e.g., due to authentication failure).
-
-        Args:
-            token: The token to disable (or None for anonymous)
-        """
-        with self._lock:
-            if token is None:
-                self._anonymous_next_available = time.time() + 3600.0
-                return
-            if token not in self._next_available:
-                return
-            del self._next_available[token]
-            self._tokens = [t for t in self._tokens if t != token]
-            if not self._tokens:
-                self._index = 0
+            if success:
+                logger.info("✅ IP Rotated successfully. Resuming crawlers...")
             else:
-                self._index %= len(self._tokens)
+                logger.error("❌ IP Rotation Failed. Sleeping 60s instead.")
+                time.sleep(60)
 
-    def _advance(self) -> None:
-        """Move to the next token in rotation."""
-        if not self._tokens:
-            return
-        self._index = (self._index + 1) % len(self._tokens)
+        except Exception as e:
+            logger.error(f"💥 Error during IP rotation: {e}")
+        finally:
+            # 3. Resume workers
+            network_ready_event.set()
+            rotation_lock.release()
 
 
 class GitHubAPIClient:
     """
     GitHub API client with automatic rate limiting and token rotation.
-
-    This class handles:
-    - Token rotation to maximize API quota
-    - Automatic rate limit detection and waiting
-    - Request retries with exponential backoff
-    - Error handling for authentication failures
+    Uses Centralized Token Manager for smart waiting and load balancing.
     """
 
     def __init__(
@@ -157,9 +71,10 @@ class GitHubAPIClient:
         owner: str,
         repo: str,
         tokens: Optional[Sequence[str]] = None,
-        token_pool: Any = None,
+        token_manager: Optional[TokenManager] = None,
         retry_count: int = 5,
         retry_delay: float = 1.0,
+        cache_dir: Optional[str] = None,
     ) -> None:
         """
         Initialize GitHub API client.
@@ -168,85 +83,200 @@ class GitHubAPIClient:
             owner: Repository owner
             repo: Repository name
             tokens: List of GitHub personal access tokens
-            token_pool: Optional external token pool instance
+            token_manager: Optional external TokenManager instance
             retry_count: Number of retries for failed requests
             retry_delay: Base delay for exponential backoff
+            cache_dir: Directory to store ETag caches
         """
         self.owner = owner
         self.repo = repo
-        if token_pool:
-            self._token_pool = token_pool
+
+        if token_manager:
+            self._token_manager = token_manager
+        elif tokens:
+            self._token_manager = TokenManager(list(tokens))
         else:
-            self._token_pool = GitHubTokenPool(tokens or [])
-        self._github_remaining: Optional[int] = None
-        self._github_reset: Optional[int] = None
+            self._token_manager = TokenManager([])
+
         self.retry_count = retry_count
         self.retry_delay = retry_delay
+        self.cache_dir = cache_dir
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
 
     @property
     def repo_slug(self) -> str:
         """Get the repository slug (owner/repo)."""
         return f"{self.owner}/{self.repo}"
 
-    def _github_headers(self, token: Optional[str]) -> Dict[str, str]:
+    def _github_headers(self, token_key: str) -> Dict[str, str]:
         """
         Build headers for GitHub API request.
-
-        Args:
-            token: GitHub access token (or None for anonymous)
-
-        Returns:
-            Dictionary of HTTP headers
         """
         headers = {
             "Accept": "application/vnd.github+json",
             "User-Agent": "travistorrent-tools-py",
         }
-        if token:
-            headers["Authorization"] = f"token {token}"
+        if token_key:
+            headers["Authorization"] = f"token {token_key}"
         return headers
 
+    def _get_cache_path(self, url: str, params: Optional[Dict] = None) -> str:
+        if not self.cache_dir:
+            return ""
+        key = f"{url}:{json.dumps(params, sort_keys=True)}"
+        hashed = hashlib.md5(key.encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{hashed}.json")
+
     def request(
-        self, url: str, params: Optional[Dict[str, Any]] = None, **kwargs: Any
+        self,
+        url: str,
+        params: Optional[Dict[str, Any]] = None,
+        method: str = "GET",
+        json_data: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> requests.Response:
         """
         Make a GitHub API request with automatic rate limit handling.
-
-        Args:
-            url: Full URL to request
-            params: Query parameters
-
-        Returns:
-            Response object
-
-        Raises:
-            RuntimeError: On authentication failure or other errors
+        Supports ETag caching if cache_dir is configured.
         """
         retries = 0
         max_retries = self.retry_count
 
+        # Check cache for ETag (only for GET)
+        etag = None
+        cache_path = ""
+        if self.cache_dir and method == "GET":
+            cache_path = self._get_cache_path(url, params)
+            if os.path.exists(cache_path):
+                try:
+                    with open(cache_path, "r") as f:
+                        cached = json.load(f)
+                        etag = cached.get("etag")
+                except Exception:
+                    pass
+
         while True:
-            token, wait_for = self._token_pool.acquire()
-            if wait_for > 0:
-                logger.info(
-                    "All GitHub tokens exhausted; sleeping for %.1f seconds",
-                    wait_for,
-                )
-                time.sleep(wait_for)
+            # 0. Check Network Ready Flag (Global Pause)
+            # If IP rotation is happening, this will block until it's done.
+            network_ready_event.wait()
+
+            # 1. Acquire Token (Blocking)
+            try:
+                token = self._token_manager.get_best_token()
+            except RuntimeError as e:
+                logger.error(f"Token acquisition failed: {e}")
+                raise
 
             try:
-                # Merge headers from kwargs if present
-                request_headers = self._github_headers(token)
+                # Prepare headers
+                request_headers = self._github_headers(token.key)
                 if "headers" in kwargs:
                     request_headers.update(kwargs.pop("headers"))
+                
+                if etag:
+                    request_headers["If-None-Match"] = etag
 
-                response = requests.get(
+                logger.info(f"🚀 Using token {token.key[:4]}... for {method} {url}")
+
+                response = requests.request(
+                    method,
                     url,
                     headers=request_headers,
                     params=params,
+                    json=json_data,
                     timeout=kwargs.get("timeout", 30),
                     **{k: v for k, v in kwargs.items() if k != "timeout"},
                 )
+
+                # 2. Update Token immediately
+                self._token_manager.update_token(token, response.headers)
+
+                # Handle 304 Not Modified
+                if response.status_code == 304 and self.cache_dir and method == "GET":
+                    logger.info(f"⚡ 304 Not Modified for {url}. Using cache.")
+                    try:
+                        with open(cache_path, "r") as f:
+                            cached_data = json.load(f)
+                        
+                        # Construct response from cache
+                        cached_resp = Response()
+                        cached_resp.status_code = 200
+                        cached_resp._content = json.dumps(cached_data["data"]).encode("utf-8")
+                        cached_resp.headers = response.headers 
+                        cached_resp.url = url
+                        return cached_resp
+                    except Exception as e:
+                        logger.warning(f"Failed to load cache for {url}: {e}")
+                        # If cache load fails, we might want to retry without ETag?
+                        # For now, just continue and maybe it will fail or we can force retry
+                        etag = None # Disable ETag for next retry if we loop
+                        # But we are inside loop. If we continue, we retry request.
+                        # Let's just force a retry without ETag
+                        continue
+
+                # Handle Rate Limits (403/429)
+                if response.status_code == 429:
+                    logger.warning(
+                        f"❌ 429 Too Many Requests. Token {token.key[:4]}... exhausted."
+                    )
+                    self._token_manager.handle_rate_limit(token)
+
+                    # Trigger IP Rotation Logic
+                    # We spawn a thread to handle rotation so this worker can loop back and wait
+                    threading.Thread(target=check_and_rotate_ip).start()
+                    continue
+
+                if response.status_code == 403:
+                    remaining = response.headers.get("X-RateLimit-Remaining")
+                    if remaining == "0":
+                        logger.warning(
+                            f"❌ 403 Rate Limit Exceeded. Token {token.key[:4]}... exhausted."
+                        )
+                        self._token_manager.handle_rate_limit(token)
+                        continue
+
+                if 400 < response.status_code < 500:
+                    # Check for spammy
+                    if "spammy" in response.text.lower():
+                        logger.warning(
+                            f"🚫 Token {token.key[:4]}... flagged as spammy."
+                        )
+                        self._token_manager.disable_token(token)
+                        continue
+
+                # Handle Server Errors (5xx) - Retry logic
+                if response.status_code >= 500:
+                    if retries < max_retries:
+                        wait_time = self.retry_delay * (2**retries)
+                        logger.warning(
+                            f"Server error {response.status_code}. Retrying in {wait_time:.1f}s..."
+                        )
+                        time.sleep(wait_time)
+                        retries += 1
+                        continue
+
+                # Success (200) - Save to cache if enabled
+                if response.status_code == 200 and self.cache_dir and method == "GET":
+                    etag_new = response.headers.get("ETag")
+                    if etag_new:
+                        try:
+                            with open(cache_path, "w") as f:
+                                json.dump({"etag": etag_new, "data": response.json()}, f)
+                        except Exception as e:
+                            logger.warning(f"Failed to write cache: {e}")
+
+                # Success or other client errors (404, etc)
+                return response
+
+            except requests.exceptions.ConnectionError:
+                # This happens if network is cut during IP rotation
+                logger.warning(
+                    "⚠️ Network Error (Likely due to IP Rotation). Retrying later..."
+                )
+                time.sleep(5)
+                continue
+
             except requests.exceptions.RequestException as e:
                 if retries < max_retries:
                     wait_time = self.retry_delay * (2**retries)
@@ -259,83 +289,6 @@ class GitHubAPIClient:
                 raise RuntimeError(
                     f"GitHub API request failed after {max_retries} retries: {e}"
                 )
-
-            self._github_remaining = int(
-                response.headers.get("X-RateLimit-Remaining", "0") or 0
-            )
-            reset_ts = response.headers.get("X-RateLimit-Reset")
-            self._github_reset = int(reset_ts) if reset_ts else None
-
-            # Handle 429 Too Many Requests
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                wait_seconds = 60.0
-                if retry_after and retry_after.isdigit():
-                    wait_seconds = max(float(retry_after), 1.0)
-
-                logger.warning(
-                    "GitHub 429 (Too Many Requests); token on cool-down for %.1fs",
-                    wait_seconds,
-                )
-                # Use mark_rate_limited to simulate cooloff
-                self._token_pool.mark_rate_limited(
-                    token, int(time.time() + wait_seconds)
-                )
-                continue
-
-            if response.status_code >= 500:
-                if retries < max_retries:
-                    wait_time = self.retry_delay * (2**retries)
-                    logger.warning(
-                        f"Server error {response.status_code}. Retrying in {wait_time:.1f}s..."
-                    )
-                    time.sleep(wait_time)
-                    retries += 1
-                    continue
-
-            # Handle 4xx errors
-            if 400 <= response.status_code < 500:
-                body_text = response.text.lower()
-
-                # Check for "spammy" detection
-                if "spammy" in body_text:
-                    logger.warning(
-                        f"GitHub token {token} flagged as spammy; disabling and rotating."
-                    )
-                    self._token_pool.disable(token)
-                    continue
-
-                if (
-                    response.status_code == 403
-                    and self._github_remaining == 0
-                    and self._github_reset
-                ):
-                    logger.warning(
-                        "GitHub rate limit reached; rotating token (reset at %s)",
-                        (
-                            datetime.fromtimestamp(self._github_reset, tz=timezone.utc)
-                            if self._github_reset
-                            else "unknown"
-                        ),
-                    )
-                    self._token_pool.mark_rate_limited(token, self._github_reset)
-                    retries = 0  # Reset retries on token rotation
-                    continue
-
-                if response.status_code == 401:
-                    self._token_pool.disable(token)
-                    raise RuntimeError(
-                        f"GitHub API authentication failed for {url}: {response.text[:200]}"
-                    )
-
-                raise RuntimeError(
-                    f"GitHub API error {response.status_code} for {url}: {response.text[:200]}"
-                )
-
-            if self._github_remaining == 0 and self._github_reset:
-                self._token_pool.mark_rate_limited(token, self._github_reset)
-
-            return response
 
     def get(
         self,
@@ -630,5 +583,25 @@ class GitHubAPIClient:
             logger.warning("Failed to fetch user %s: %s", username, exc)
             return None
 
+    def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Execute a GraphQL query.
+        """
+        url = "https://api.github.com/graphql"
+        response = self.request(
+            url, 
+            method="POST", 
+            json_data={"query": query, "variables": variables or {}}
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            if "errors" in data:
+                logger.error(f"GraphQL Errors: {data['errors']}")
+            return data
+        else:
+            logger.error(f"GraphQL Request Failed: {response.status_code} {response.text}")
+            return {}
 
-__all__ = ["GitHubAPIClient", "GitHubTokenPool", "RateLimitExceeded"]
+
+__all__ = ["GitHubAPIClient"]

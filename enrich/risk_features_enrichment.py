@@ -18,13 +18,11 @@ from tqdm import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from github_api_client import GitHubAPIClient
-    from token_pool import MongoTokenPool, GitHubTokenPoolAdapter, InMemoryTokenPool
+    from token_pool import TokenManager
 except ImportError:
     # Fallback for when running in a different context or if files are missing
     GitHubAPIClient = None
-    MongoTokenPool = None
-    GitHubTokenPoolAdapter = None
-    InMemoryTokenPool = None
+    TokenManager = None
 
 # Setup logging
 logging.basicConfig(
@@ -387,7 +385,7 @@ def get_risk_features(row, repo_dir, client=None):
 
 
 def process_project_group(
-    project_name, group, repos_dir, config, token_pool_adapter, cleanup=True
+    project_name, group, repos_dir, config, token_manager, cleanup=True
 ):
     logger.info(f"[{project_name}] Processing {len(group)} rows")
 
@@ -403,19 +401,25 @@ def process_project_group(
 
     # Initialize Client if needed
     client = None
-    if GitHubAPIClient and token_pool_adapter:
+    if GitHubAPIClient and token_manager:
         client = GitHubAPIClient(
             owner,
             repo,
-            token_pool=token_pool_adapter,
+            token_manager=token_manager,
             retry_count=config.get("github_api_retry_count", 3),
             retry_delay=config.get("github_api_retry_delay", 1.0),
         )
 
     results = []
     missing_logs = []
+    total_rows = len(group)
 
-    for idx, row in group.iterrows():
+    for idx, (index, row) in enumerate(group.iterrows()):
+        commit_sha = row["git_trigger_commit"]
+        logger.info(
+            f"[{project_name}] Processing commit {commit_sha} ({idx + 1}/{total_rows})"
+        )
+
         feats, log = get_risk_features(row, repo_dir, client)
         if log:
             missing_logs.append(log)
@@ -436,7 +440,7 @@ def process_project_group(
     return pd.DataFrame(results), missing_logs
 
 
-def process_batch(batch_df, config, token_pool_adapter, repos_dir, executor):
+def process_batch(batch_df, config, token_manager, repos_dir, executor):
     grouped = batch_df.groupby("gh_project_name")
     project_groups = [group for _, group in grouped]
 
@@ -450,7 +454,7 @@ def process_batch(batch_df, config, token_pool_adapter, repos_dir, executor):
             group,
             repos_dir,
             config,
-            token_pool_adapter,
+            token_manager,
         ): i
         for i, group in enumerate(project_groups)
     }
@@ -516,9 +520,6 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--merge", action="store_true", help="Merge results at the end")
-    parser.add_argument(
-        "--no-mongo", action="store_true", help="Use in-memory token pool"
-    )
     args = parser.parse_args()
 
     # Priority: Env Var > Args
@@ -526,11 +527,6 @@ def main():
     OUTPUT_DIR = os.environ.get("OUTPUT_DIR", args.output_dir)
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", args.batch_size))
     ENABLE_MERGE = os.environ.get("ENABLE_MERGE", str(args.merge)).lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-    NO_MONGO = os.environ.get("NO_MONGO", str(args.no_mongo)).lower() in (
         "true",
         "1",
         "yes",
@@ -546,30 +542,19 @@ def main():
     # Load Config & Setup Token Pool
     config = load_config(CONFIG_PATH)
 
-    mongo_uri = os.environ.get(
-        "MONGO_URI", config.get("mongo_uri", "mongodb://localhost:27017")
-    )
-    db_name = os.environ.get("DB_NAME", config.get("db_name", "ci_crawler"))
-
-    token_pool = None
-    if NO_MONGO or not MongoTokenPool:
-        logger.info("Using InMemoryTokenPool")
-        token_pool = InMemoryTokenPool(
-            token_file=os.environ.get("TOKEN_FILE", "tokens.txt")
-        )
-    else:
-        logger.info(f"Using MongoTokenPool at {mongo_uri}")
-        token_pool = MongoTokenPool(mongo_uri, db_name)
-
-    # Seed tokens
+    # Load tokens from Env Var (comma separated) or Config
     tokens_env = os.environ.get("GITHUB_TOKENS", "")
     if tokens_env:
         tokens = [t.strip() for t in tokens_env.split(",") if t.strip()]
-        token_pool.seed_tokens("github", tokens)
-    elif "github_tokens" in config:
-        token_pool.seed_tokens("github", config["github_tokens"])
+    else:
+        tokens = config.get("github_tokens", [])
 
-    pool_adapter = GitHubTokenPoolAdapter(token_pool) if token_pool else None
+    logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
+    if TokenManager:
+        token_manager = TokenManager(tokens)
+    else:
+        logger.warning("TokenManager class not available (ImportError).")
+        token_manager = None
 
     # Resume Capability: Check existing parquet files
     processed_ids = set()
@@ -633,11 +618,8 @@ def main():
             logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
 
             try:
-                if isinstance(token_pool, InMemoryTokenPool):
-                    token_pool.reload_from_file()
-
                 df_enriched, logs = process_batch(
-                    chunk.copy(), config, pool_adapter, args.repos_dir, executor
+                    chunk.copy(), config, token_manager, args.repos_dir, executor
                 )
 
                 # Save logs

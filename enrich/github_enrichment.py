@@ -10,7 +10,6 @@ import glob
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-from tqdm import tqdm
 from datetime import datetime, timedelta
 import shutil
 
@@ -18,7 +17,7 @@ import shutil
 # Add parent directory to path to import github_api_client and token_pool
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from github_api_client import GitHubAPIClient
-from token_pool import MongoTokenPool, GitHubTokenPoolAdapter, InMemoryTokenPool
+from token_pool import TokenManager
 
 # Setup logging
 logging.basicConfig(
@@ -151,18 +150,63 @@ def clone_repo(repo_url, clone_dir):
 
 
 def get_pr_features(client, pr_number, row):
-    logger.info(f"Fetching PR features for PR #{pr_number}")
+    logger.info(f"Fetching PR features for PR #{pr_number} (GraphQL)")
     features = {}
+    
+    query = """
+    query ($owner: String!, $repo: String!, $pr_number: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr_number) {
+          title
+          body
+          state
+          createdAt
+          closedAt
+          mergedAt
+          labels(first: 100) {
+            nodes {
+              name
+            }
+          }
+          reviewRequests(first: 100) {
+            nodes {
+              requestedReviewer {
+                ... on User {
+                  login
+                }
+              }
+            }
+          }
+          reviews(first: 100) {
+            nodes {
+              state
+              body
+              submittedAt
+              author {
+                login
+              }
+            }
+          }
+        }
+      }
+    }
+    """
+
     try:
-        pr_data = client.get_pull_request(pr_number)
+        data = client.graphql(query, {"owner": client.owner, "repo": client.repo, "pr_number": int(pr_number)})
+        pr_data = data.get("data", {}).get("repository", {}).get("pullRequest")
+        
         if pr_data:
-            requested_reviewers = pr_data.get("requested_reviewers", [])
+            # 1. Reviewers
+            requested_reviewers = pr_data.get("reviewRequests", {}).get("nodes", [])
             features["gh_num_reviewers"] = len(requested_reviewers)
 
+            # 2. Linked Issues
             body = pr_data.get("body", "")
             features["gh_linked_issues_count"] = parse_linked_issues(body)
 
-            labels = pr_data.get("labels", [])
+            # 3. Bug Label
+            labels = pr_data.get("labels", {}).get("nodes", [])
             has_bug = any(
                 "bug" in lbl["name"].lower() or "fix" in lbl["name"].lower()
                 for lbl in labels
@@ -172,7 +216,8 @@ def get_pr_features(client, pr_number, row):
                 f"PR {pr_number}: reviewers={len(requested_reviewers)}, has_bug_label={has_bug}"
             )
 
-            reviews = client.get_pull_reviews(pr_number)
+            # 4. Approvals & Sentiment
+            reviews = pr_data.get("reviews", {}).get("nodes", [])
             approvals = [r for r in reviews if r["state"] == "APPROVED"]
             features["gh_num_approvals"] = len(approvals)
             logger.debug(
@@ -182,9 +227,9 @@ def get_pr_features(client, pr_number, row):
             total_sentiment = 0
             review_count = 0
             for r in reviews:
-                body = r.get("body", "")
-                if body:
-                    total_sentiment += calculate_sentiment(body)
+                r_body = r.get("body", "")
+                if r_body:
+                    total_sentiment += calculate_sentiment(r_body)
                     review_count += 1
             features["gh_review_sentiment"] = (
                 total_sentiment / review_count if review_count > 0 else 0
@@ -193,17 +238,28 @@ def get_pr_features(client, pr_number, row):
                 f"PR {pr_number}: review_sentiment={features['gh_review_sentiment']}"
             )
 
+            # 5. Time to First Review
             try:
                 pr_created_at = pd.to_datetime(row["gh_pr_created_at"])
                 if reviews:
-                    reviews.sort(key=lambda x: x["submitted_at"])
-                    first_review_at = pd.to_datetime(reviews[0]["submitted_at"])
-                    diff = (first_review_at - pr_created_at).total_seconds() / 3600
-                    features["gh_time_to_first_review"] = max(0, diff)
-                    logger.debug(
-                        f"PR {pr_number}: time_to_first_review={features['gh_time_to_first_review']} hours"
-                    )
-            except Exception:
+                    valid_reviews = [r for r in reviews if r.get("submittedAt")]
+                    if valid_reviews:
+                        valid_reviews.sort(key=lambda x: x["submittedAt"])
+                        first_review_at = pd.to_datetime(valid_reviews[0]["submittedAt"])
+                        
+                        # Normalize timezones
+                        if pr_created_at.tz is None:
+                             pr_created_at = pr_created_at.tz_localize('UTC')
+                        if first_review_at.tz is None:
+                             first_review_at = first_review_at.tz_localize('UTC')
+                        
+                        diff = (first_review_at - pr_created_at).total_seconds() / 3600
+                        features["gh_time_to_first_review"] = max(0, diff)
+                        logger.debug(
+                            f"PR {pr_number}: time_to_first_review={features['gh_time_to_first_review']} hours"
+                        )
+            except Exception as e:
+                logger.debug(f"Time calc error: {e}")
                 pass
     except Exception as e:
         logger.error(f"Error fetching PR {pr_number}: {e}")
@@ -384,7 +440,7 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
 
 
 def process_project_group(
-    project_name, group, config, token_pool_adapter, repos_dir, executor, cleanup=True
+    project_name, group, config, token_manager, repos_dir, executor, cleanup=True
 ):
     """
     Process a group of rows belonging to the same project.
@@ -398,7 +454,7 @@ def process_project_group(
     client = GitHubAPIClient(
         owner,
         repo,
-        token_pool=token_pool_adapter,
+        token_manager=token_manager,
         retry_count=config.get("github_api_retry_count", 5),
         retry_delay=config.get("github_api_retry_delay", 1.0),
     )
@@ -549,7 +605,7 @@ def process_project_group(
 
 
 def process_batch(
-    batch_df, config, token_pool_adapter, repos_dir, executor, projects_to_keep=None
+    batch_df, config, token_manager, repos_dir, executor, projects_to_keep=None
 ):
     logger.info(f"Processing batch: rows={len(batch_df)}")
     # Group by project within the batch
@@ -572,7 +628,7 @@ def process_batch(
             project_name,
             group.copy(),
             config,
-            token_pool_adapter,
+            token_manager,
             repos_dir,
             executor,
             cleanup=should_cleanup,
@@ -580,7 +636,9 @@ def process_batch(
         results.append(processed_group)
         all_missing_logs.extend(logs)
 
-    return pd.concat(results), all_missing_logs
+    if results:
+        return pd.concat(results), all_missing_logs
+    return pd.DataFrame(), all_missing_logs
 
 
 def merge_results(output_dir):
@@ -656,11 +714,6 @@ def main():
         action="store_true",
         help="Merge results into per-project CSVs at the end",
     )
-    parser.add_argument(
-        "--no-mongo",
-        action="store_true",
-        help="Use in-memory token pool instead of MongoDB",
-    )
     args = parser.parse_args()
 
     # Priority: Env Var > Args
@@ -668,11 +721,6 @@ def main():
     OUTPUT_DIR = os.environ.get("OUTPUT_DIR", args.output_dir)
     BATCH_SIZE = int(os.environ.get("BATCH_SIZE", args.batch_size))
     ENABLE_MERGE = os.environ.get("ENABLE_MERGE", str(args.merge)).lower() in (
-        "true",
-        "1",
-        "yes",
-    )
-    NO_MONGO = os.environ.get("NO_MONGO", str(args.no_mongo)).lower() in (
         "true",
         "1",
         "yes",
@@ -686,24 +734,9 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Load Config & Setup Token Pool
-    # Load Config & Setup Token Pool
     # Allow CONFIG_PATH env var
     config_path_env = os.environ.get("CONFIG_PATH", CONFIG_PATH)
     config = load_config(config_path_env)
-
-    mongo_uri = os.environ.get(
-        "MONGO_URI", config.get("mongo_uri", "mongodb://localhost:27017")
-    )
-    db_name = os.environ.get("DB_NAME", config.get("db_name", "ci_crawler"))
-
-    if NO_MONGO:
-        logger.info("Using InMemoryTokenPool (NO_MONGO=True)")
-        # Check for token file env var
-        token_file = os.environ.get("TOKEN_FILE", "tokens.txt")
-        token_pool = InMemoryTokenPool(token_file=token_file)
-    else:
-        logger.info(f"Using MongoTokenPool at {mongo_uri}")
-        token_pool = MongoTokenPool(mongo_uri, db_name)
 
     # Load tokens from Env Var (comma separated) or Config
     tokens_env = os.environ.get("GITHUB_TOKENS", "")
@@ -712,9 +745,8 @@ def main():
     else:
         tokens = config.get("github_tokens", [])
 
-    if tokens:
-        token_pool.seed_tokens("github", tokens)
-    pool_adapter = GitHubTokenPoolAdapter(token_pool)
+    logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
+    token_manager = TokenManager(tokens)
 
     # Use a local temporary directory for cloning repos
     # We cannot clone to GCS directly.
@@ -798,10 +830,6 @@ def main():
         ):
             logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
             try:
-                # Reload tokens if using InMemoryTokenPool
-                if isinstance(token_pool, InMemoryTokenPool):
-                    token_pool.reload_from_file()
-
                 # Determine projects to keep for the next batch
                 next_batch_projects = set()
                 if i + 1 < len(chunks):
@@ -811,7 +839,7 @@ def main():
                 df_enriched, logs = process_batch(
                     chunk.copy(),
                     config,
-                    pool_adapter,
+                    token_manager,
                     repos_dir,
                     executor,
                     projects_to_keep=next_batch_projects,

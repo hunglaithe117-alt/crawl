@@ -1,389 +1,139 @@
-"""Mongo-backed token pool with round-robin selection and cooldowns."""
+"""Token pool management with smart rate limiting and load balancing."""
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import Iterable, Tuple, Protocol, Dict, List, Optional, Any
 import threading
 import time
-import os
-
-from pymongo import MongoClient, ReturnDocument
-from pymongo.collection import Collection
-from pymongo.errors import OperationFailure
+from typing import List, Optional, Dict, Any
 
 LOGGER = logging.getLogger(__name__)
 
 
-class TokenPool(Protocol):
-    def acquire(self, token_type: str) -> Tuple[Optional[str], float]: ...
-    def cooloff(self, token_type: str, token: str, seconds: float) -> None: ...
-    def disable_token(self, token_type: str, token: str) -> None: ...
-    def mark_rate_limited(
-        self, token_type: str, token: Optional[str], reset_epoch: int
-    ) -> None: ...
-    def has_tokens(self, token_type: str) -> bool: ...
-    def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None: ...
-    def add_token(self, token_type: str, token: str, enable: bool = True) -> bool: ...
-    def remove_token(self, token_type: str, token: str) -> bool: ...
+class Token:
+    """Represents a GitHub API token with its rate limit state."""
+
+    def __init__(self, token_str: str):
+        self.key = token_str.strip()
+        self.remaining = 5000  # Assume max initially
+        self.reset_time = 0.0  # Unix timestamp
+        self.is_disabled = False
+
+    def __repr__(self) -> str:
+        return f"<Token {self.key[:4]}... Rem:{self.remaining}>"
 
 
-class GitHubTokenPoolAdapter:
-    """Adapter to make TokenPool compatible with GitHubAPIClient."""
-
-    def __init__(self, pool: TokenPool, token_type: str = "github"):
-        self.pool = pool
-        self.token_type = token_type
-
-    def acquire(self) -> Tuple[Optional[str], float]:
-        return self.pool.acquire(self.token_type)
-
-    def mark_rate_limited(self, token: Optional[str], reset_epoch: int) -> None:
-        self.pool.mark_rate_limited(self.token_type, token, reset_epoch)
-
-    def disable(self, token: Optional[str]) -> None:
-        if token is None:
-            # Anonymous auth failed or rate limited?
-            # GitHubTokenPool disables anonymous for 1 hour on disable(None)
-            reset_epoch = int(time.time() + 3600)
-            self.pool.mark_rate_limited(self.token_type, None, reset_epoch)
-        else:
-            self.pool.disable_token(self.token_type, token)
-
-
-class MongoTokenPool:
+class TokenManager:
     """
-    Token rotation backed by MongoDB.
-
-    Tokens are stored with fields:
-    - type: "github" or "travis"
-    - token: secret value
-    - disabled: bool
-    - cooldown_until: datetime when token becomes available
-    - last_used: datetime for round-robin ordering
+    Centralized Token Manager (Singleton-like behavior).
+    Manages a pool of tokens, handles smart waiting, and load balancing.
     """
 
-    def __init__(
-        self, mongo_uri: str, db_name: str, collection: str = "tokens"
-    ) -> None:
-        self.client = MongoClient(mongo_uri)
-        self.collection: Collection = self.client[db_name][collection]
-        try:
-            self._ensure_indexes()
-        except OperationFailure as exc:
-            LOGGER.error(
-                "Cannot ensure Mongo indexes for token pool (auth/permission issue): %s",
-                exc,
-            )
-            raise
-        except Exception as exc:
-            LOGGER.error("Cannot ensure Mongo indexes for token pool: %s", exc)
-            raise
+    def __init__(self, tokens: List[str]):
+        # Deduplicate and create Token objects
+        unique_tokens = set(t.strip() for t in tokens if t.strip())
+        self.tokens = [Token(t) for t in unique_tokens]
+        self.pool_lock = threading.Lock()
 
-    def _ensure_indexes(self) -> None:
-        self.collection.create_index([("type", 1), ("token", 1)], unique=True)
-        self.collection.create_index(
-            [("type", 1), ("disabled", 1), ("cooldown_until", 1)]
-        )
-
-    def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None:
-        """Idempotently add a list of tokens into the pool."""
-        for token in tokens:
-            self.add_token(token_type, token, enable=True)
-
-    def add_token(self, token_type: str, token: str, enable: bool = True) -> bool:
-        """Insert or re-enable a token. Returns True if inserted/updated."""
-        token = (token or "").strip()
-        if not token:
-            return False
-
-        now = datetime.now(timezone.utc)
-        try:
-            result = self.collection.update_one(
-                {"type": token_type, "token": token},
-                {
-                    "$setOnInsert": {
-                        "last_used": datetime.fromtimestamp(0, tz=timezone.utc)
-                    },
-                    "$set": {
-                        "disabled": not enable,
-                        "cooldown_until": datetime.fromtimestamp(0, tz=timezone.utc),
-                        "updated_at": now,
-                    },
-                },
-                upsert=True,
-            )
-            return result.upserted_id is not None or result.modified_count > 0
-        except OperationFailure as exc:
-            LOGGER.error("Mongo auth/permission failed when adding token: %s", exc)
-            raise
-
-    def disable_token(self, token_type: str, token: str) -> None:
-        """Disable a token permanently (e.g., auth failure)."""
-        self.collection.update_one(
-            {"type": token_type, "token": token},
-            {"$set": {"disabled": True, "updated_at": datetime.now(timezone.utc)}},
-        )
-
-    def remove_token(self, token_type: str, token: str) -> bool:
-        """Remove a token from the pool entirely."""
-        token = (token or "").strip()
-        if not token:
-            return False
-        result = self.collection.delete_one({"type": token_type, "token": token})
-        return result.deleted_count > 0
-
-    def mark_rate_limited(
-        self, token_type: str, token: Optional[str], reset_epoch: int
-    ) -> None:
-        """Mark token as unavailable until the given epoch seconds."""
-        query = {"type": token_type, "token": token}
-        update: Dict[str, Any] = {
-            "$set": {
-                "cooldown_until": datetime.fromtimestamp(reset_epoch, tz=timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            }
-        }
-
-        if token is None:
-            # Upsert for anonymous token
-            update["$setOnInsert"] = {
-                "disabled": False,
-                "last_used": datetime.fromtimestamp(0, tz=timezone.utc),
-            }
-            self.collection.update_one(query, update, upsert=True)
-        else:
-            self.collection.update_one(query, update)
-
-    def cooloff(self, token_type: str, token: str, seconds: float) -> None:
-        """Mark token unavailable for a short duration."""
-        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-        self.collection.update_one(
-            {"type": token_type, "token": token},
-            {
-                "$set": {
-                    "cooldown_until": until,
-                    "updated_at": datetime.now(timezone.utc),
-                }
-            },
-        )
-
-    def acquire(self, token_type: str) -> Tuple[str | None, float]:
+    def get_best_token(self) -> Token:
         """
-        Acquire an available token and return (token, wait_seconds).
-
-        If no token is immediately available, returns (None, wait_seconds).
+        Blocking method: Waits until a usable token is available.
+        Implements smart sleeping if all tokens are exhausted.
         """
-        now = datetime.now(timezone.utc)
-        doc = self.collection.find_one_and_update(
-            {
-                "type": token_type,
-                "disabled": False,
-                "$or": [
-                    {"cooldown_until": {"$exists": False}},
-                    {"cooldown_until": {"$lte": now}},
-                ],
-            },
-            {"$set": {"last_used": now}},
-            sort=[("last_used", 1), ("_id", 1)],
-            return_document=ReturnDocument.AFTER,
-        )
-        if doc:
-            return doc.get("token"), 0.0
+        while True:
+            with self.pool_lock:
+                current_time = time.time()
+                available_tokens = []
+                valid_tokens_exist = False
 
-        waiting = self.collection.find_one(
-            {"type": token_type, "disabled": False},
-            sort=[("cooldown_until", 1)],
-        )
-        if waiting and waiting.get("cooldown_until"):
-            cooldown = waiting["cooldown_until"]
-            # Ensure cooldown is offset-aware (UTC) if it comes back naive from Mongo
-            if cooldown.tzinfo is None:
-                cooldown = cooldown.replace(tzinfo=timezone.utc)
-            wait_seconds = max((cooldown - now).total_seconds(), 0.0)
-            return None, wait_seconds
-        return None, 0.0
+                for t in self.tokens:
+                    if t.is_disabled:
+                        continue
+                    
+                    valid_tokens_exist = True
 
-    def has_tokens(self, token_type: str) -> bool:
-        return (
-            self.collection.count_documents({"type": token_type, "disabled": False}) > 0
-        )
+                    # If reset time has passed, optimistically reset remaining
+                    # This handles cases where we waited locally or just started up
+                    if current_time > t.reset_time and t.remaining == 0:
+                        t.remaining = 5000
 
-    def next_ready_in(self, token_type: str) -> float:
-        now = datetime.now(timezone.utc)
-        waiting = self.collection.find_one(
-            {"type": token_type, "disabled": False},
-            sort=[("cooldown_until", 1)],
-        )
-        if waiting and waiting.get("cooldown_until"):
-            return max((waiting["cooldown_until"] - now).total_seconds(), 0.0)
-        return 0.0
+                    if t.remaining > 0:
+                        available_tokens.append(t)
 
+                if not valid_tokens_exist:
+                    raise RuntimeError("All tokens have been disabled/flagged as spam.")
 
-class InMemoryTokenPool:
-    """
-    In-memory token rotation (non-persistent).
-    """
+                # Strategy: Load Balancing (Pick token with most remaining requests)
+                if available_tokens:
+                    selected_token = max(available_tokens, key=lambda x: x.remaining)
+                    return selected_token
 
-    def __init__(self, token_file: Optional[str] = None) -> None:
-        # {token_type: [{token: str, disabled: bool, cooldown_until: float, last_used: float}]}
-        self._store: Dict[str, List[Dict[str, Any]]] = {}
-        self._anonymous_state: Dict[str, Dict[str, Any]] = {}
-        self._lock = threading.Lock()
-        self.token_file = token_file
-        if self.token_file:
-            self.reload_from_file()
+                # No tokens available -> Smart Wait
+                # Find the earliest reset time among all non-disabled tokens
+                active_tokens = [t for t in self.tokens if not t.is_disabled]
+                if not active_tokens:
+                     raise RuntimeError("All tokens disabled.")
+                
+                soonest_reset = min(t.reset_time for t in active_tokens)
+                wait_seconds = soonest_reset - current_time + 1.0  # +1s buffer
 
-    def reload_from_file(self) -> None:
-        """Reload tokens from the configured token file."""
-        if not self.token_file or not os.path.exists(self.token_file):
-            return
+                if wait_seconds < 0:
+                    wait_seconds = 1.0
 
-        try:
-            with open(self.token_file, "r") as f:
-                lines = f.readlines()
+                LOGGER.warning(
+                    f"⚠️ ALL TOKENS EXHAUSTED. System sleeping for {wait_seconds:.2f}s..."
+                )
 
-            # Simple format: token_string (assumes github type for now, or format type:token)
-            # Let's assume just tokens for github for simplicity as per requirement
-            for line in lines:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
+            # Sleep outside the lock to allow other threads to reach this point 
+            # (though they will also likely sleep or wait for lock)
+            time.sleep(wait_seconds)
 
-                # Check if type is specified "type:token"
-                if ":" in line:
-                    parts = line.split(":", 1)
-                    t_type, t_token = parts[0], parts[1]
-                else:
-                    t_type, t_token = "github", line
+    def update_token(self, token: Token, headers: Any) -> None:
+        """Update token state from GitHub API response headers."""
+        with self.pool_lock:
+            try:
+                # headers keys are case-insensitive in requests, but let's be safe
+                # requests.structures.CaseInsensitiveDict handles this usually
+                remaining = headers.get("X-RateLimit-Remaining")
+                reset = headers.get("X-RateLimit-Reset")
 
-                self.add_token(t_type, t_token)
+                if remaining is not None:
+                    token.remaining = int(remaining)
+                if reset is not None:
+                    token.reset_time = float(reset)
 
-            LOGGER.info(f"Reloaded tokens from {self.token_file}")
-        except Exception as e:
-            LOGGER.error(f"Failed to reload tokens from file: {e}")
+                LOGGER.debug(
+                    f"🔄 Updated {token.key[:4]}... | Rem: {token.remaining} | Resets in: {int(token.reset_time - time.time())}s"
+                )
+            except Exception as e:
+                LOGGER.error(f"Error updating token {token.key[:4]}...: {e}")
 
-    def seed_tokens(self, token_type: str, tokens: Iterable[str]) -> None:
-        for token in tokens:
-            self.add_token(token_type, token)
+    def handle_rate_limit(self, token: Token) -> None:
+        """Manually mark token as exhausted (e.g. on 403/429)."""
+        with self.pool_lock:
+            token.remaining = 0
+            # We don't know the exact reset time without headers, 
+            # but usually update_token is called with headers before this if available.
+            # If this is called, it means we want to force rotation.
+            # If reset_time is in the past, bump it slightly to force wait/check?
+            # Actually, just setting remaining=0 is enough for get_best_token to skip it
+            # until reset_time passes.
+            if token.reset_time < time.time():
+                 token.reset_time = time.time() + 60 # Default cooloff if unknown
 
-    def add_token(self, token_type: str, token: str, enable: bool = True) -> bool:
-        token = (token or "").strip()
-        if not token:
-            return False
-        with self._lock:
-            if token_type not in self._store:
-                self._store[token_type] = []
-
-            # Check if exists
-            for item in self._store[token_type]:
-                if item["token"] == token:
-                    item["disabled"] = not enable
-                    item["cooldown_until"] = 0.0
-                    return False
-
-            self._store[token_type].append(
-                {
-                    "token": token,
-                    "disabled": not enable,
-                    "cooldown_until": 0.0,
-                    "last_used": 0.0,
-                }
-            )
-            return True
-
-    def disable_token(self, token_type: str, token: str) -> None:
-        with self._lock:
-            items = self._store.get(token_type, [])
-            for item in items:
-                if item["token"] == token:
-                    item["disabled"] = True
-                    break
-
-    def remove_token(self, token_type: str, token: str) -> bool:
-        with self._lock:
-            if token_type not in self._store:
-                return False
-            initial_len = len(self._store[token_type])
-            self._store[token_type] = [
-                t for t in self._store[token_type] if t["token"] != token
-            ]
-            return len(self._store[token_type]) < initial_len
-
-    def mark_rate_limited(
-        self, token_type: str, token: Optional[str], reset_epoch: int
-    ) -> None:
-        with self._lock:
-            if token is None:
-                if token_type not in self._anonymous_state:
-                    self._anonymous_state[token_type] = {}
-                self._anonymous_state[token_type]["cooldown_until"] = float(reset_epoch)
-                return
-
-            items = self._store.get(token_type, [])
-            for item in items:
-                if item["token"] == token:
-                    item["cooldown_until"] = float(reset_epoch)
-                    break
-
-    def cooloff(self, token_type: str, token: str, seconds: float) -> None:
-        until = time.time() + seconds
-        with self._lock:
-            items = self._store.get(token_type, [])
-            for item in items:
-                if item["token"] == token:
-                    item["cooldown_until"] = until
-                    break
-
-    def acquire(self, token_type: str) -> Tuple[Optional[str], float]:
-        now = time.time()
-        with self._lock:
-            items = self._store.get(token_type, [])
-            # Filter usable
-            candidates = [
-                t for t in items if not t["disabled"] and t["cooldown_until"] <= now
-            ]
-            if candidates:
-                # Sort by last_used to round-robin
-                candidates.sort(key=lambda x: x["last_used"])
-                chosen = candidates[0]
-                chosen["last_used"] = now
-                return chosen["token"], 0.0
-
-            # If we have tokens but none are ready
-            if items:
-                waiting = [
-                    t for t in items if not t["disabled"] and t["cooldown_until"] > now
-                ]
-                if waiting:
-                    min_wait = min(t["cooldown_until"] for t in waiting) - now
-                    return None, max(min_wait, 0.0)
-                return None, 0.0
-
-            # No tokens configured, check anonymous
-            anon_state = self._anonymous_state.get(token_type, {})
-            anon_cooldown = anon_state.get("cooldown_until", 0.0)
-            if anon_cooldown > now:
-                return None, anon_cooldown - now
-
-            return None, 0.0
-
-    def has_tokens(self, token_type: str) -> bool:
-        with self._lock:
-            items = self._store.get(token_type, [])
-            return any(not t["disabled"] for t in items)
-
-    def next_ready_in(self, token_type: str) -> float:
-        now = time.time()
-        with self._lock:
-            items = self._store.get(token_type, [])
-            waiting = [
-                t for t in items if not t["disabled"] and t["cooldown_until"] > now
-            ]
-            if waiting:
-                return max(min(t["cooldown_until"] for t in waiting) - now, 0.0)
-            return 0.0
+    def disable_token(self, token: Token) -> None:
+        """Permanently disable a token (e.g. bad credentials, spammy)."""
+        with self.pool_lock:
+            token.is_disabled = True
+            LOGGER.error(f"🚫 Token {token.key[:4]}... disabled permanently.")
 
 
-__all__ = ["MongoTokenPool", "InMemoryTokenPool", "GitHubTokenPoolAdapter"]
+# Keep MongoTokenPool for backward compatibility if needed, 
+# but the user request focuses on the new logic. 
+# We will leave the rest of the file (MongoTokenPool) as is or remove it if it conflicts.
+# The user provided a full replacement logic for the "pool" concept.
+# I will append the MongoTokenPool class below if I were editing, but here I am replacing.
+# However, to be safe and clean, I will just provide the new classes requested.
+# If the user needs Mongo, they can ask to reintegrate it. 
+# Based on "Update các file... Đây là yêu cầu tôi cần", I'll stick to the requested design.
+
