@@ -152,7 +152,7 @@ def clone_repo(repo_url, clone_dir):
 def get_pr_features(client, pr_number, row):
     logger.info(f"Fetching PR features for PR #{pr_number} (GraphQL)")
     features = {}
-    
+
     query = """
     query ($owner: String!, $repo: String!, $pr_number: Int!) {
       repository(owner: $owner, name: $repo) {
@@ -193,9 +193,12 @@ def get_pr_features(client, pr_number, row):
     """
 
     try:
-        data = client.graphql(query, {"owner": client.owner, "repo": client.repo, "pr_number": int(pr_number)})
+        data = client.graphql(
+            query,
+            {"owner": client.owner, "repo": client.repo, "pr_number": int(pr_number)},
+        )
         pr_data = data.get("data", {}).get("repository", {}).get("pullRequest")
-        
+
         if pr_data:
             # 1. Reviewers
             requested_reviewers = pr_data.get("reviewRequests", {}).get("nodes", [])
@@ -245,14 +248,16 @@ def get_pr_features(client, pr_number, row):
                     valid_reviews = [r for r in reviews if r.get("submittedAt")]
                     if valid_reviews:
                         valid_reviews.sort(key=lambda x: x["submittedAt"])
-                        first_review_at = pd.to_datetime(valid_reviews[0]["submittedAt"])
-                        
+                        first_review_at = pd.to_datetime(
+                            valid_reviews[0]["submittedAt"]
+                        )
+
                         # Normalize timezones
                         if pr_created_at.tz is None:
-                             pr_created_at = pr_created_at.tz_localize('UTC')
+                            pr_created_at = pr_created_at.tz_localize("UTC")
                         if first_review_at.tz is None:
-                             first_review_at = first_review_at.tz_localize('UTC')
-                        
+                            first_review_at = first_review_at.tz_localize("UTC")
+
                         diff = (first_review_at - pr_created_at).total_seconds() / 3600
                         features["gh_time_to_first_review"] = max(0, diff)
                         logger.debug(
@@ -710,6 +715,9 @@ def main():
         "--batch-size", type=int, default=1000, help="Batch size for processing"
     )
     parser.add_argument(
+        "--repos-dir", default="/tmp/repos_risk", help="Temp dir for repos"
+    )
+    parser.add_argument(
         "--merge",
         action="store_true",
         help="Merge results into per-project CSVs at the end",
@@ -732,6 +740,7 @@ def main():
 
     # Ensure output dir exists
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(args.repos_dir, exist_ok=True)
 
     # Load Config & Setup Token Pool
     # Allow CONFIG_PATH env var
@@ -747,11 +756,6 @@ def main():
 
     logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
     token_manager = TokenManager(tokens)
-
-    # Use a local temporary directory for cloning repos
-    # We cannot clone to GCS directly.
-    repos_dir = os.environ.get("REPOS_DIR", "/tmp/repos")
-    os.makedirs(repos_dir, exist_ok=True)
 
     # 1. Load Source
     logger.info(f"Loading source data from {INPUT_CSV}")
@@ -840,21 +844,14 @@ def main():
                     chunk.copy(),
                     config,
                     token_manager,
-                    repos_dir,
+                    args.repos_dir,
                     executor,
                     projects_to_keep=next_batch_projects,
                 )
 
                 # Save logs
                 if logs:
-                    batch_log_filename = (
-                        f"missing_commits_log_{int(datetime.now().timestamp())}_{i}.csv"
-                    )
-                    batch_log_path = os.path.join(OUTPUT_DIR, batch_log_filename)
-
                     try:
-                        # Create a DF and save to csv/parquet
-                        log_df = pd.DataFrame(logs, columns=["log_entry"])
                         with open(missing_commits_log_path, "a") as f:
                             for log in logs:
                                 f.write(log + "\n")
