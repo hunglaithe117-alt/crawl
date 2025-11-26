@@ -103,15 +103,7 @@ def calculate_entropy(file_changes):
     return entropy
 
 
-def get_risk_features(row, repo_dir, client=None):
-    features = {}
-    missing_log = None  # (tr_build_id, project, commit, reason)
-
-    commit_sha = row["git_trigger_commit"]
-    project_name = row["gh_project_name"]
-    build_id = row.get("tr_build_id", "unknown")
-
-    # 1. Build Hour Risk Score
+def get_build_time(row, repo_dir, commit_sha, client):
     build_time = None
     if "gh_build_started_at" in row and not pd.isna(row["gh_build_started_at"]):
         try:
@@ -135,53 +127,35 @@ def get_risk_features(row, repo_dir, client=None):
                 ):
                     date_str = commit_data["commit"]["author"]["date"]
                     build_time = pd.to_datetime(date_str)
-            except Exception as e:
+            except Exception:
                 pass
+    return build_time
 
-    if build_time:
-        # 0-23
-        hour = build_time.hour
-        weekday = build_time.weekday()  # 0=Mon, 6=Sun
 
-        risk_score = 0.0
-        if 0 <= hour <= 5:
-            risk_score = 1.0  # Late night fatigue
-        elif weekday >= 5:
-            risk_score = 0.8  # Weekend work
-        elif weekday == 4 and hour >= 16:
-            risk_score = 0.9  # Friday afternoon rush
-        else:
-            risk_score = 0.1  # Normal working hours
+def calculate_build_hour_risk(build_time):
+    if not build_time:
+        return None, None, None
 
-        features["build_hour_risk_score"] = risk_score
-        features["build_hour_sin"] = math.sin(2 * math.pi * hour / 24)
-        features["build_hour_cos"] = math.cos(2 * math.pi * hour / 24)
+    # 0-23
+    hour = build_time.hour
+    weekday = build_time.weekday()  # 0=Mon, 6=Sun
+
+    risk_score = 0.0
+    if 0 <= hour <= 5:
+        risk_score = 1.0  # Late night fatigue
+    elif weekday >= 5:
+        risk_score = 0.8  # Weekend work
+    elif weekday == 4 and hour >= 16:
+        risk_score = 0.9  # Friday afternoon rush
     else:
-        features["build_hour_risk_score"] = None
-        features["build_hour_sin"] = None
-        features["build_hour_cos"] = None
-        if not missing_log:
-            missing_log = (
-                build_id,
-                project_name,
-                commit_sha,
-                "Could not determine build time (Git & API failed)",
-            )
+        risk_score = 0.1  # Normal working hours
 
-    if missing_log:
-        return features, missing_log
+    sin_time = math.sin(2 * math.pi * hour / 24)
+    cos_time = math.cos(2 * math.pi * hour / 24)
+    return risk_score, sin_time, cos_time
 
-    # 2. Src/Test Churn Ratio
-    src_churn = float(row.get("git_diff_src_churn", 0) or 0)
-    test_churn = float(row.get("git_diff_test_churn", 0) or 0)
-    features["src_test_churn_ratio"] = test_churn / (src_churn + 1e-6)
 
-    # 3. Description Length vs Churn
-    desc_complexity = float(row.get("gh_description_complexity", 0) or 0)
-    total_churn = src_churn + test_churn
-    features["description_length_vs_churn"] = desc_complexity / (total_churn + 1e-6)
-
-    # 4. Is New Contributor
+def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
     is_new_contributor = None
 
     # Try Git First
@@ -252,28 +226,20 @@ def get_risk_features(row, repo_dir, client=None):
                         is_new_contributor = 0  # Found commits older than 90 days
                     else:
                         # No commits older than 90 days.
-                        # Does this mean they are new? Yes, likely.
-                        # (Assuming they have commits *after* cutoff, which they do, since we have the current commit)
                         is_new_contributor = 1
 
-        except Exception as e:
-            # logger.warning(f"API fallback for is_new_contributor failed: {e}")
+        except Exception:
             pass
 
     if is_new_contributor is None:
-        if not missing_log:
-            missing_log = (
-                build_id,
-                project_name,
-                commit_sha,
-                "Skipped is_new_contributor (Git & API failed)",
-            )
+        return None, "Skipped is_new_contributor (Git & API failed)"
 
-    if missing_log:
-        return features, missing_log
+    return is_new_contributor, None
 
-    features["is_new_contributor"] = is_new_contributor
 
+def calculate_change_entropy_feature(
+    row, repo_dir, commit_sha, client, project_name, build_id
+):
     # 5. Change Entropy
     commits_to_scan = []
     if not pd.isna(row.get("git_all_built_commits")):
@@ -323,28 +289,73 @@ def get_risk_features(row, repo_dir, client=None):
                                 file_changes_map.get(filename, 0) + changes
                             )
                     commit_processed = True
-            except Exception as e:
-                # logger.warning(f"API failed for entropy {sha}: {e}")
+            except Exception:
                 pass
 
         if not commit_processed:
             entropy_failed = True
-            if not missing_log:
-                missing_log = (
-                    build_id,
-                    project_name,
-                    sha,
-                    "Entropy failed: Git & API failed",
-                )
-            break  # Stop processing if one commit fails, as entropy will be invalid
+            return None, f"Entropy failed: Commit {sha} not found"
 
     if not entropy_failed:
         changes_list = list(file_changes_map.values())
-        features["change_entropy"] = calculate_entropy(changes_list)
-    else:
-        features["change_entropy"] = None
+        return calculate_entropy(changes_list), None
 
-    return features, missing_log
+    return None, "Entropy failed: Unknown error"
+
+
+def get_risk_features(row, repo_dir, client=None):
+    features = {}
+
+    commit_sha = row["git_trigger_commit"]
+    project_name = row["gh_project_name"]
+    build_id = row.get("tr_build_id", "unknown")
+
+    # 1. Build Hour Risk Score
+    build_time = get_build_time(row, repo_dir, commit_sha, client)
+
+    if build_time:
+        risk_score, sin_time, cos_time = calculate_build_hour_risk(build_time)
+        features["build_hour_risk_score"] = risk_score
+        features["build_hour_sin"] = sin_time
+        features["build_hour_cos"] = cos_time
+    else:
+        features["build_hour_risk_score"] = None
+        features["build_hour_sin"] = None
+        features["build_hour_cos"] = None
+        return features, (
+            build_id,
+            project_name,
+            commit_sha,
+            "Could not determine build time (Git & API failed)",
+        )
+
+    # 2. Src/Test Churn Ratio
+    src_churn = float(row.get("git_diff_src_churn", 0) or 0)
+    test_churn = float(row.get("git_diff_test_churn", 0) or 0)
+    features["src_test_churn_ratio"] = test_churn / (src_churn + 1e-6)
+
+    # 3. Description Length vs Churn
+    desc_complexity = float(row.get("gh_description_complexity", 0) or 0)
+    total_churn = src_churn + test_churn
+    features["description_length_vs_churn"] = desc_complexity / (total_churn + 1e-6)
+
+    # 4. Is New Contributor
+    is_new_contributor, error_reason = check_is_new_contributor(
+        repo_dir, commit_sha, build_time, client
+    )
+    if error_reason:
+        return features, (build_id, project_name, commit_sha, error_reason)
+    features["is_new_contributor"] = is_new_contributor
+
+    # 5. Change Entropy
+    entropy, error_reason = calculate_change_entropy_feature(
+        row, repo_dir, commit_sha, client, project_name, build_id
+    )
+    if error_reason:
+        return features, (build_id, project_name, commit_sha, error_reason)
+    features["change_entropy"] = entropy
+
+    return features, None
 
 
 def process_project_group(
