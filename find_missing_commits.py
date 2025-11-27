@@ -6,6 +6,7 @@ For each unique (gh_project_name, git_trigger_commit) pair the script:
 1. Clones/fetches the repository into a local cache directory (bare clone).
 2. Fetches branches, tags, and pull request refs (refs/pull/*/{head,merge}).
 3. Marks a commit as "missing" if `git cat-file -e <sha>^{commit}` fails after the fetch.
+4. Removes the local bare repo after processing each project (use --keep-repos to skip).
 
 The output is a small CSV with two columns: gh_project_name, git_trigger_commit.
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
+import shutil
 import subprocess
 import sys
 from collections import defaultdict
@@ -73,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         "--only-project",
         type=str,
         help="If set, process only this gh_project_name (owner/repo).",
+    )
+    parser.add_argument(
+        "--keep-repos",
+        action="store_true",
+        help="Keep fetched bare repos on disk. Default behavior cleans them after each project.",
     )
     parser.add_argument(
         "--verbose",
@@ -156,6 +163,17 @@ def commit_exists(repo_dir: Path, sha: str) -> bool:
     return proc.returncode == 0
 
 
+def cleanup_repo(repo_dir: Path) -> None:
+    """Remove the bare repo directory to save space."""
+    try:
+        shutil.rmtree(repo_dir)
+        parent = repo_dir.parent
+        if parent.exists() and not any(parent.iterdir()):
+            parent.rmdir()
+    except Exception:
+        logger.debug("Cleanup failed for %s", repo_dir, exc_info=True)
+
+
 def load_commit_map(
     input_path: Path, chunk_size: int, limit: Optional[int], only_project: Optional[str]
 ) -> Tuple[Dict[str, Set[str]], int]:
@@ -198,11 +216,15 @@ def process_repo(slug: str, commits: Set[str], args: argparse.Namespace) -> Tupl
     if repo_dir is None:
         return slug, []
 
-    fetched = fetch_repo(slug, repo_dir, args.fetch_depth)
-    if not fetched:
-        return slug, []
+    missing: List[str] = []
+    try:
+        fetched = fetch_repo(slug, repo_dir, args.fetch_depth)
+        if fetched:
+            missing = [sha for sha in commits if not commit_exists(repo_dir, sha)]
+    finally:
+        if not args.keep_repos:
+            cleanup_repo(repo_dir)
 
-    missing = [sha for sha in commits if not commit_exists(repo_dir, sha)]
     return slug, missing
 
 
