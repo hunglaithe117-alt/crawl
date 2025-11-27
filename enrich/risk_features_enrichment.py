@@ -24,6 +24,7 @@ except ImportError:
     GitHubAPIClient = None
     TokenManager = None
 
+
 # A small handler that uses tqdm.write to avoid breaking the progress bar
 class TqdmLoggingHandler(logging.Handler):
     """Logging handler that writes messages through tqdm to avoid interfering with the progress bar."""
@@ -200,19 +201,32 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
             ).strip()
 
             if author:
+                # Use git log --reverse to find the oldest commit.
+                # Do NOT use -n 1 with --reverse as it filters first then reverses (showing the newest).
+                # We want the oldest, so we list all (or use rev-list) and take the first.
                 cmd_log = [
                     "git",
                     "log",
+                    "--all",
                     "--author",
                     author,
                     "--reverse",
                     "--format=%ct",
-                    "-n",
-                    "1",
                 ]
-                first_commit_ts = subprocess.check_output(
-                    cmd_log, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
-                ).strip()
+                # Use Popen to read only the first line to avoid loading huge history
+                try:
+                    with subprocess.Popen(
+                        cmd_log,
+                        cwd=repo_dir,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    ) as proc:
+                        if proc.stdout:
+                            first_commit_ts = proc.stdout.readline().strip()
+                        proc.terminate()
+                except Exception:
+                    first_commit_ts = None
 
                 if first_commit_ts:
                     first_ts = int(first_commit_ts)
@@ -250,7 +264,7 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
 
                 # Remove duplicates and None
                 identifiers = list(set(filter(None, identifiers)))
-                
+
                 if not identifiers:
                     logger.warning(f"No identifiers found for commit {commit_sha}")
 
@@ -268,13 +282,19 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                         # GET /repos/.../commits?author=X&until=cutoff&per_page=1
                         try:
                             older_commits = client.get_commits(
-                                params={"author": ident, "until": cutoff_str, "per_page": 1}
+                                params={
+                                    "author": ident,
+                                    "until": cutoff_str,
+                                    "per_page": 1,
+                                }
                             )
                             if older_commits:
                                 found_older = True
                                 break
                         except Exception as e:
-                            logger.warning(f"Failed to check older commits for {ident}: {e}")
+                            logger.warning(
+                                f"Failed to check older commits for {ident}: {e}"
+                            )
 
                     if found_older:
                         is_new_contributor = 0  # Found commits older than 90 days
@@ -390,11 +410,6 @@ def get_risk_features(row, repo_dir, client=None):
     src_churn = float(row.get("git_diff_src_churn", 0) or 0)
     test_churn = float(row.get("git_diff_test_churn", 0) or 0)
     features["src_test_churn_ratio"] = test_churn / (src_churn + 1e-6)
-
-    # 3. Description Length vs Churn
-    desc_complexity = float(row.get("gh_description_complexity", 0) or 0)
-    total_churn = src_churn + test_churn
-    features["description_length_vs_churn"] = desc_complexity / (total_churn + 1e-6)
 
     # 4. Is New Contributor
     is_new_contributor, error_reason = check_is_new_contributor(
@@ -636,7 +651,6 @@ def main():
         "build_hour_cos",
         "src_test_churn_ratio",
         "change_entropy",
-        "description_length_vs_churn",
     ]
     for col in new_cols:
         if col not in df_source.columns:
