@@ -25,18 +25,42 @@ def merge_results(output_dir):
         logger.warning("No parquet files found to merge.")
         return
 
-    logger.info(f"Found {len(files)} parquet files. Processing with DuckDB...")
+    logger.info(f"Found {len(files)} parquet files. Validating files...")
 
     con = None
     try:
-        # Use DuckDB to read and group
         con = duckdb.connect(database=":memory:")
+        
+        valid_files = []
+        corrupted_dir = os.path.join(output_dir, "corrupted")
+        
+        for f in files:
+            try:
+                # Quick check if file is readable by DuckDB
+                con.execute(f"SELECT 1 FROM read_parquet('{f}') LIMIT 1")
+                valid_files.append(f)
+            except Exception as e:
+                logger.warning(f"⚠️ Skipping corrupted file: {f} (Error: {e})")
+                # Move to corrupted folder
+                os.makedirs(corrupted_dir, exist_ok=True)
+                try:
+                    filename = os.path.basename(f)
+                    os.rename(f, os.path.join(corrupted_dir, filename))
+                    logger.info(f"Moved {filename} to {corrupted_dir}")
+                except OSError as move_err:
+                    logger.error(f"Failed to move corrupted file: {move_err}")
+
+        if not valid_files:
+            logger.warning("No valid parquet files found to merge.")
+            return
+
+        logger.info(f"Processing {len(valid_files)} valid files with DuckDB...")
 
         # Register the parquet files as a view
-        # We use a glob pattern to let DuckDB handle the file reading
-        parquet_pattern = os.path.join(output_dir, "part_*.parquet")
+        # We pass the list of files to read_parquet
+        files_sql = ", ".join([f"'{f}'" for f in valid_files])
         con.execute(
-            f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet('{parquet_pattern}')"
+            f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet([{files_sql}])"
         )
 
         # Output directory for merged files

@@ -244,9 +244,15 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                     name = commit_data["commit"]["author"].get("name")
                     if name:
                         identifiers.append(name)
+                    email = commit_data["commit"]["author"].get("email")
+                    if email:
+                        identifiers.append(email)
 
                 # Remove duplicates and None
                 identifiers = list(set(filter(None, identifiers)))
+                
+                if not identifiers:
+                    logger.warning(f"No identifiers found for commit {commit_sha}")
 
                 if identifiers:
                     cutoff_date = (
@@ -260,20 +266,26 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                     for ident in identifiers:
                         # Check for commits by identifier BEFORE cutoff
                         # GET /repos/.../commits?author=X&until=cutoff&per_page=1
-                        older_commits = client.get_commits(
-                            params={"author": ident, "until": cutoff_str, "per_page": 1}
-                        )
-                        if older_commits:
-                            found_older = True
-                            break
+                        try:
+                            older_commits = client.get_commits(
+                                params={"author": ident, "until": cutoff_str, "per_page": 1}
+                            )
+                            if older_commits:
+                                found_older = True
+                                break
+                        except Exception as e:
+                            logger.warning(f"Failed to check older commits for {ident}: {e}")
 
                     if found_older:
                         is_new_contributor = 0  # Found commits older than 90 days
                     else:
                         # No commits older than 90 days for ANY identifier
                         is_new_contributor = 1
+            else:
+                logger.warning(f"Failed to get commit data for {commit_sha}")
 
-        except Exception:
+        except Exception as e:
+            logger.error(f"API check failed for {commit_sha}: {e}")
             pass
 
     if is_new_contributor is None:

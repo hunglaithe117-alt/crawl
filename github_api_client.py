@@ -172,11 +172,11 @@ class GitHubAPIClient:
                 request_headers = self._github_headers(token.key)
                 if "headers" in kwargs:
                     request_headers.update(kwargs.pop("headers"))
-                
+
                 if etag:
                     request_headers["If-None-Match"] = etag
 
-                logger.info(f"🚀 Using token {token.key[:4]}... for {method} {url}")
+                logger.info(f"🚀 Using token {token.key} for {method} {url}")
 
                 response = requests.request(
                     method,
@@ -197,33 +197,37 @@ class GitHubAPIClient:
                     try:
                         with open(cache_path, "r") as f:
                             cached_data = json.load(f)
-                        
+
                         # Construct response from cache
                         cached_resp = Response()
                         cached_resp.status_code = 200
-                        cached_resp._content = json.dumps(cached_data["data"]).encode("utf-8")
-                        cached_resp.headers = response.headers 
+                        cached_resp._content = json.dumps(cached_data["data"]).encode(
+                            "utf-8"
+                        )
+                        cached_resp.headers = response.headers
                         cached_resp.url = url
                         return cached_resp
                     except Exception as e:
                         logger.warning(f"Failed to load cache for {url}: {e}")
                         # If cache load fails, we might want to retry without ETag?
                         # For now, just continue and maybe it will fail or we can force retry
-                        etag = None # Disable ETag for next retry if we loop
+                        etag = None  # Disable ETag for next retry if we loop
                         # But we are inside loop. If we continue, we retry request.
                         # Let's just force a retry without ETag
                         continue
 
                 # Handle Invalid Token (401)
                 if response.status_code == 401:
-                    logger.error(f"🚫 Token {token.key[:4]}... is INVALID (401). Removing from pool.")
+                    logger.error(
+                        f"🚫 Token {token.key} is INVALID (401). Removing from pool."
+                    )
                     self._token_manager.remove_token(token)
                     continue
 
                 # Handle Rate Limits (403/429)
                 if response.status_code == 429:
                     logger.warning(
-                        f"❌ 429 Too Many Requests. Token {token.key[:4]}... exhausted."
+                        f"❌ 429 Too Many Requests. Token {token.key} exhausted."
                     )
                     self._token_manager.handle_rate_limit(token)
 
@@ -236,7 +240,7 @@ class GitHubAPIClient:
                     remaining = response.headers.get("X-RateLimit-Remaining")
                     if remaining == "0":
                         logger.warning(
-                            f"❌ 403 Rate Limit Exceeded. Token {token.key[:4]}... exhausted."
+                            f"❌ 403 Rate Limit Exceeded. Token {token.key} exhausted."
                         )
                         self._token_manager.handle_rate_limit(token)
                         continue
@@ -245,7 +249,7 @@ class GitHubAPIClient:
                     # Check for spammy
                     if "spammy" in response.text.lower():
                         logger.warning(
-                            f"🚫 Token {token.key[:4]}... flagged as spammy."
+                            f"🚫 Token {token.key} flagged as spammy."
                         )
                         self._token_manager.disable_token(token)
                         continue
@@ -267,7 +271,9 @@ class GitHubAPIClient:
                     if etag_new:
                         try:
                             with open(cache_path, "w") as f:
-                                json.dump({"etag": etag_new, "data": response.json()}, f)
+                                json.dump(
+                                    {"etag": etag_new, "data": response.json()}, f
+                                )
                         except Exception as e:
                             logger.warning(f"Failed to write cache: {e}")
 
@@ -588,24 +594,26 @@ class GitHubAPIClient:
             logger.warning("Failed to fetch user %s: %s", username, exc)
             return None
 
-    def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def graphql(
+        self, query: str, variables: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         """
         Execute a GraphQL query.
         """
         url = "https://api.github.com/graphql"
         response = self.request(
-            url, 
-            method="POST", 
-            json_data={"query": query, "variables": variables or {}}
+            url, method="POST", json_data={"query": query, "variables": variables or {}}
         )
-        
+
         if response.status_code == 200:
             data = response.json()
             if "errors" in data:
                 logger.error(f"GraphQL Errors: {data['errors']}")
             return data
         else:
-            logger.error(f"GraphQL Request Failed: {response.status_code} {response.text}")
+            logger.error(
+                f"GraphQL Request Failed: {response.status_code} {response.text}"
+            )
             return {}
 
 

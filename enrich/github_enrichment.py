@@ -19,6 +19,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from github_api_client import GitHubAPIClient
 from token_pool import TokenManager
 
+
 class TqdmLoggingHandler(logging.Handler):
     """Logging handler that writes messages through tqdm to avoid interfering with the progress bar."""
 
@@ -311,6 +312,23 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     except Exception:
         pass
 
+    # Fallback to API if git failed
+    if commit_ts is None:
+        try:
+            logger.info(f"Falling back to API for commit date: {commit_sha}")
+            c_data = client.get_commit(commit_sha)
+            if c_data and "commit" in c_data and "author" in c_data["commit"]:
+                c_date_str = c_data["commit"]["author"]["date"]
+                if c_date_str:
+                    dt = pd.to_datetime(c_date_str)
+                    commit_ts = int(dt.timestamp())
+                    commit_date = datetime.fromtimestamp(commit_ts)
+                    logger.debug(
+                        f"Commit {commit_sha} date (API): {commit_date.isoformat()}"
+                    )
+        except Exception as e:
+            logger.warning(f"Failed to fetch commit date via API for {commit_sha}: {e}")
+
     touched_files = set()
     build_authors_name = set()
     built_commits_in_window = 0
@@ -377,10 +395,12 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
         return features, missing_log
 
     # File Change Frequency
+    commits_on_files = 0
     num_touched_files = len(touched_files)
     if num_touched_files > 0 and "gh_num_commits_on_files_touched" in row:
-        commits_on_files = row["gh_num_commits_on_files_touched"]
-        if not pd.isna(commits_on_files):
+        val = row["gh_num_commits_on_files_touched"]
+        if not pd.isna(val):
+            commits_on_files = val
             # Add built commits in the last 3 months
             commits_on_files += built_commits_in_window
             features["file_change_frequency"] = commits_on_files / num_touched_files
@@ -447,11 +467,15 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
             except Exception:
                 pass
 
+    # Use commits_on_files as it represents the total activity on these files in the window.
+    # Fallback to total_commits_scanned (from git log) if commits_on_files is 0.
+    denominator = commits_on_files if commits_on_files > 0 else total_commits_scanned
+
     logger.debug(
-        f"Commit {commit_sha}: total_commits_scanned={total_commits_scanned}, owned_commits_count={owned_commits_count}"
+        f"Commit {commit_sha}: denominator={denominator} (commits_on_files={commits_on_files}, scanned={total_commits_scanned}), owned={owned_commits_count}"
     )
-    if total_commits_scanned > 0:
-        features["author_ownership"] = owned_commits_count / total_commits_scanned
+    if denominator > 0:
+        features["author_ownership"] = owned_commits_count / denominator
         logger.info(
             f"Commit {commit_sha}: author_ownership={features['author_ownership']}"
         )
@@ -788,17 +812,20 @@ def main():
     if mongo_uri:
         try:
             from token_pool import MongoTokenManager
+
             db_name = config.get("db_name", "ci_crawler")
             logger.info(f"Initializing MongoTokenManager with DB {db_name}")
             token_manager = MongoTokenManager(mongo_uri, db_name)
-            
+
             # Seed tokens if provided and not in DB
             if tokens:
                 logger.info(f"Seeding {len(tokens)} tokens into MongoDB...")
                 for t in tokens:
                     token_manager.add_token("github", t)
         except Exception as e:
-            logger.warning(f"Failed to init MongoTokenManager: {e}. Falling back to memory.")
+            logger.warning(
+                f"Failed to init MongoTokenManager: {e}. Falling back to memory."
+            )
             token_manager = TokenManager(tokens)
     else:
         logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
@@ -812,7 +839,6 @@ def main():
     except Exception as e:
         logger.error(f"Failed to read CSV with DuckDB: {e}")
         sys.exit(1)
-
 
     # Initialize new columns
     new_cols = [
