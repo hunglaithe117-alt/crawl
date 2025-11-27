@@ -147,21 +147,67 @@ def get_build_time(row, repo_dir, commit_sha, client):
     return build_time
 
 
-def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
-    is_new_contributor = None
+def build_author_first_commit_map(repo_dir):
+    """
+    Build a lookup of author name -> oldest commit timestamp once per repo to avoid
+    running git log for every row.
+    """
+    author_first_commit = {}
+    if not repo_dir or not os.path.exists(repo_dir):
+        return author_first_commit
 
-    # Try Git First
+    try:
+        cmd = ["git", "log", "--all", "--format=%an%x09%ct"]
+        output = subprocess.check_output(
+            cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
+        )
+        for line in output.splitlines():
+            if "\t" not in line:
+                continue
+            author, ts_str = line.split("\t", 1)
+            try:
+                ts = int(ts_str.strip())
+            except ValueError:
+                continue
+            prev = author_first_commit.get(author)
+            if prev is None or ts < prev:
+                author_first_commit[author] = ts
+    except Exception:
+        pass
+
+    return author_first_commit
+
+
+def check_is_new_contributor(
+    repo_dir, commit_sha, build_time, client, author_first_commit_map
+):
+    is_new_contributor = None
+    author = None
+
+    # Try Git First and use precomputed author commit map to avoid per-row log scans
     if repo_dir and os.path.exists(repo_dir):
         try:
             cmd = ["git", "show", "-s", "--format=%an", commit_sha]
             author = subprocess.check_output(
                 cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
             ).strip()
+        except Exception:
+            author = None
 
-            if author:
-                # Use git log --reverse to find the oldest commit.
-                # Do NOT use -n 1 with --reverse as it filters first then reverses (showing the newest).
-                # We want the oldest, so we list all (or use rev-list) and take the first.
+        if author and author_first_commit_map:
+            first_ts = author_first_commit_map.get(author)
+            if first_ts is not None:
+                current_ts = (
+                    int(build_time.timestamp())
+                    if build_time
+                    else int(datetime.now().timestamp())
+                )
+                diff_days = (current_ts - first_ts) / (3600 * 24)
+                is_new_contributor = 1 if diff_days < 90 else 0
+
+        # If precomputed map missed, fall back to a targeted git log for this author
+        if is_new_contributor is None and author:
+            try:
                 cmd_log = [
                     "git",
                     "log",
@@ -171,21 +217,14 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                     "--reverse",
                     "--format=%ct",
                 ]
-                # Use Popen to read only the first line to avoid loading huge history
-                try:
-                    with subprocess.Popen(
-                        cmd_log,
-                        cwd=repo_dir,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                    ) as proc:
-                        if proc.stdout:
-                            first_commit_ts = proc.stdout.readline().strip()
-                        proc.terminate()
-                except Exception:
-                    first_commit_ts = None
-
+                with subprocess.Popen(
+                    cmd_log,
+                    cwd=repo_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                ) as proc:
+                    first_commit_ts = proc.stdout.readline().strip() if proc.stdout else ""
                 if first_commit_ts:
                     first_ts = int(first_commit_ts)
                     current_ts = (
@@ -195,8 +234,8 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                     )
                     diff_days = (current_ts - first_ts) / (3600 * 24)
                     is_new_contributor = 1 if diff_days < 90 else 0
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     # Fallback to API
     if is_new_contributor is None and client:
@@ -273,6 +312,12 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
 
 
 def get_risk_features(row, repo_dir, client=None):
+    return get_risk_features_with_cache(row, repo_dir, client, None)
+
+
+def get_risk_features_with_cache(
+    row, repo_dir, client=None, author_first_commit_map=None
+):
     features = {}
 
     commit_sha = row["git_trigger_commit"]
@@ -282,7 +327,11 @@ def get_risk_features(row, repo_dir, client=None):
     build_time = get_build_time(row, repo_dir, commit_sha, client)
 
     is_new_contributor, error_reason = check_is_new_contributor(
-        repo_dir, commit_sha, build_time, client
+        repo_dir,
+        commit_sha,
+        build_time,
+        client,
+        author_first_commit_map or {},
     )
     if error_reason:
         return features, (build_id, project_name, commit_sha, error_reason)
@@ -305,6 +354,9 @@ def process_project_group(
     if not has_repo:
         logger.warning(f"[{project_name}] Failed to clone, will use API fallback")
         repo_dir = None
+        author_first_commit_map = {}
+    else:
+        author_first_commit_map = build_author_first_commit_map(repo_dir)
 
     # Initialize Client if needed
     client = None
@@ -327,7 +379,9 @@ def process_project_group(
             f"[{project_name}] Processing commit {commit_sha} ({idx + 1}/{total_rows})"
         )
 
-        feats, log = get_risk_features(row, repo_dir, client)
+        feats, log = get_risk_features_with_cache(
+            row, repo_dir, client, author_first_commit_map
+        )
         if log:
             missing_logs.append(log)
             continue  # Skip this row if enrichment failed
