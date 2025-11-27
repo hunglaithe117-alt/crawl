@@ -26,6 +26,13 @@ Module này xử lý việc thu thập dữ liệu và làm giàu các tính nă
 Di chuyển vào thư mục `crawl`:
 
 ```bash
+# 1. Cập nhật hệ thống
+sudo apt-get update
+
+# 2. Cài Python, pip và venv (môi trường ảo)
+sudo apt-get install -y python3-pip python3-venv git
+sudo apt-get install tmux
+sudo apt install htop -y
 cd crawl
 ```
 

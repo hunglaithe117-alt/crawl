@@ -146,7 +146,6 @@ def main():
 
     results = []
 
-    # Sequential or Parallel? Let's do parallel
     max_workers = config.get("max_workers", 5)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_project = {
