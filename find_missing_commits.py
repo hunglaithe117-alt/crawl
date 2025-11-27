@@ -20,6 +20,7 @@ import logging
 import shutil
 import subprocess
 import sys
+import threading
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -81,6 +82,16 @@ def parse_args() -> argparse.Namespace:
         "--keep-repos",
         action="store_true",
         help="Keep fetched bare repos on disk. Default behavior cleans them after each project.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing output/checkpoint files to avoid re-processing repos.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=Path,
+        help="Optional path to a checkpoint file (tracks processed repos). Default: <output>.checkpoint",
     )
     parser.add_argument(
         "--verbose",
@@ -175,6 +186,23 @@ def cleanup_repo(repo_dir: Path) -> None:
         logger.debug("Cleanup failed for %s", repo_dir, exc_info=True)
 
 
+def load_checkpoint(path: Path) -> Set[str]:
+    """Load processed repository slugs from a checkpoint file."""
+    processed: Set[str] = set()
+    if not path.exists():
+        return processed
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            slug = line.split(",", 1)[0].strip()
+            if slug:
+                processed.add(slug)
+    except Exception:
+        logger.warning("Could not read checkpoint file %s", path)
+    return processed
+
+
 def load_commit_map(
     input_path: Path, chunk_size: int, limit: Optional[int], only_project: Optional[str]
 ) -> Tuple[Dict[str, Set[str]], int]:
@@ -243,24 +271,59 @@ def main() -> None:
         raise SystemExit(f"Input file not found: {args.input}")
 
     output_path = args.output or args.input.with_name(f"{args.input.name}.missing-commits.csv")
+    checkpoint_path = args.checkpoint or output_path.with_suffix(f"{output_path.suffix}.checkpoint")
+
+    processed_repos = load_checkpoint(checkpoint_path) if args.resume else set()
+
     logger.info("Reading %s", args.input)
     commit_map, rows_read = load_commit_map(args.input, args.chunk_size, args.limit, args.only_project)
+    if processed_repos:
+        logger.info("Checkpoint loaded: %s repos already processed.", len(processed_repos))
     logger.info("Collected %s unique repositories from %s rows", len(commit_map), rows_read)
 
     if not commit_map:
         logger.warning("No repositories to process. Check filters or input columns.")
         return
 
+    if processed_repos:
+        # Filter out repos already processed
+        commit_map = {slug: commits for slug, commits in commit_map.items() if slug not in processed_repos}
+
+    if not commit_map:
+        logger.info("All repositories were already processed; nothing to do.")
+        return
+
     total_repos = len(commit_map)
-    processed = 0
+    processed = len(processed_repos)
     missing_count = 0
     failed_repos: List[Tuple[str, str]] = []  # (slug, reason)
 
     # Prepare output writer (streaming to avoid large memory use)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+    output_exists = output_path.exists()
+    mode = "a" if (args.resume and output_exists) else "w"
+    # If resuming and appending, compute current missing_count from file (lines - header)
+    if args.resume and output_exists:
+        try:
+            with output_path.open("r", encoding="utf-8") as f:
+                missing_count = max(0, sum(1 for _ in f) - 1)
+            logger.info("Resuming with %s missing commits already recorded.", missing_count)
+        except Exception:
+            logger.warning("Could not count existing output rows; continuing without initial count.")
+
+    cp_mode = "a" if (args.resume and checkpoint_path.exists()) else "w"
+
+    output_lock = threading.Lock()
+    checkpoint_lock = threading.Lock()
+
+    with output_path.open(mode, newline="", encoding="utf-8") as handle, checkpoint_path.open(
+        cp_mode, encoding="utf-8"
+    ) as cp_handle:
         writer = csv.writer(handle)
-        writer.writerow(["gh_project_name", "git_trigger_commit"])
+        if mode == "w":
+            writer.writerow(["gh_project_name", "git_trigger_commit"])
 
         # Process repos in a bounded thread pool; tune max_workers to avoid overwhelming GitHub.
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -287,10 +350,15 @@ def main() -> None:
                     logger.warning("Skipping %s due to %s", repo_slug, status)
 
                 if missing:
-                    for sha in sorted(missing):
-                        writer.writerow([repo_slug, sha])
-                        missing_count += 1
-                    handle.flush()
+                    with output_lock:
+                        for sha in sorted(missing):
+                            writer.writerow([repo_slug, sha])
+                            missing_count += 1
+                        handle.flush()
+
+                with checkpoint_lock:
+                    cp_handle.write(f"{repo_slug},{status}\n")
+                    cp_handle.flush()
 
                 if processed % 10 == 0 or processed == total_repos:
                     logger.info(
