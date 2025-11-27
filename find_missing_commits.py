@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+"""
+Identify commits from filtered_travistorrent.csv that no longer exist in their repositories.
+
+For each unique (gh_project_name, git_trigger_commit) pair the script:
+1. Clones/fetches the repository into a local cache directory (bare clone).
+2. Fetches branches, tags, and pull request refs (refs/pull/*/{head,merge}).
+3. Marks a commit as "missing" if `git cat-file -e <sha>^{commit}` fails after the fetch.
+
+The output is a small CSV with two columns: gh_project_name, git_trigger_commit.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import logging
+import subprocess
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Find commits that cannot be checked out in their repository (likely deleted PR heads)."
+    )
+    parser.add_argument(
+        "--input",
+        type=Path,
+        required=True,
+        help="Path to CSV containing gh_project_name and git_trigger_commit (e.g., 19314170/filtered_travistorrent.csv).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="Where to write the CSV of missing commits. Default: <input>.missing-commits.csv",
+    )
+    parser.add_argument(
+        "--repos-dir",
+        type=Path,
+        default=Path(__file__).with_name("repos"),
+        help="Directory to cache bare clones (default: ./repos next to this script).",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=250_000,
+        help="Rows per chunk when reading the input CSV.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Optional cap on number of input rows to scan (useful for quick tests).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Number of repositories to fetch in parallel.",
+    )
+    parser.add_argument(
+        "--fetch-depth",
+        type=int,
+        help="Optional --depth for git fetch; omit for full history.",
+    )
+    parser.add_argument(
+        "--only-project",
+        type=str,
+        help="If set, process only this gh_project_name (owner/repo).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable INFO-level logging.",
+    )
+    return parser.parse_args()
+
+
+def run_git(args: Sequence[str], cwd: Path) -> subprocess.CompletedProcess:
+    """Run a git command and return the completed process."""
+    cmd = ["git", "-C", str(cwd), *args]
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def ensure_repo(slug: str, repos_dir: Path) -> Optional[Path]:
+    """
+    Prepare a bare clone for the given repo slug (owner/repo).
+
+    Returns the repo path or None if initialization failed.
+    """
+    if "/" not in slug:
+        logger.warning("Invalid gh_project_name (missing /): %s", slug)
+        return None
+
+    owner, repo = slug.split("/", 1)
+    repo_dir = repos_dir / owner / repo
+    repo_url = f"https://github.com/{slug}.git"
+
+    if not repo_dir.exists():
+        repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        init_proc = subprocess.run(
+            ["git", "init", "--bare", str(repo_dir)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        if init_proc.returncode != 0:
+            logger.warning("Failed to init %s: %s", slug, init_proc.stdout.strip())
+            return None
+
+    # Ensure the path is a git repo
+    check_proc = run_git(["rev-parse", "--git-dir"], repo_dir)
+    if check_proc.returncode != 0:
+        logger.warning("Path is not a git repo, skipping %s: %s", slug, check_proc.stdout.strip())
+        return None
+
+    # Ensure origin remote exists
+    remote_proc = run_git(["remote", "get-url", "origin"], repo_dir)
+    if remote_proc.returncode != 0:
+        add_proc = run_git(["remote", "add", "origin", repo_url], repo_dir)
+        if add_proc.returncode != 0:
+            logger.warning("Failed to add origin for %s: %s", slug, add_proc.stdout.strip())
+            return None
+
+    return repo_dir
+
+
+def fetch_repo(slug: str, repo_dir: Path, fetch_depth: Optional[int]) -> bool:
+    """Fetch branches, tags, and PR refs into the bare repo."""
+    refspecs = [
+        "+refs/heads/*:refs/remotes/origin/*",
+        "+refs/tags/*:refs/tags/*",
+        "+refs/pull/*/head:refs/pull/*/head",
+        "+refs/pull/*/merge:refs/pull/*/merge",
+    ]
+
+    cmd: List[str] = ["fetch", "--force", "--prune", "--tags"]
+    if fetch_depth:
+        cmd.append(f"--depth={fetch_depth}")
+    cmd.append("origin")
+    cmd.extend(refspecs)
+
+    proc = run_git(cmd, repo_dir)
+    if proc.returncode != 0:
+        logger.warning("Fetch failed for %s: %s", slug, proc.stdout.strip())
+        return False
+    return True
+
+
+def commit_exists(repo_dir: Path, sha: str) -> bool:
+    """Return True if the commit object exists locally."""
+    proc = run_git(["cat-file", "-e", f"{sha}^{{commit}}"], repo_dir)
+    return proc.returncode == 0
+
+
+def load_commit_map(
+    input_path: Path, chunk_size: int, limit: Optional[int], only_project: Optional[str]
+) -> Tuple[Dict[str, Set[str]], int]:
+    """
+    Read gh_project_name/git_trigger_commit pairs into a dict of repo -> set(commits).
+    Returns (commit_map, rows_read).
+    """
+    commit_map: Dict[str, Set[str]] = defaultdict(set)
+    rows_read = 0
+
+    for chunk in pd.read_csv(
+        input_path,
+        usecols=["gh_project_name", "git_trigger_commit"],
+        chunksize=chunk_size,
+        dtype=str,
+    ):
+        for slug, sha in zip(chunk["gh_project_name"], chunk["git_trigger_commit"]):
+            if pd.isna(slug) or pd.isna(sha):
+                continue
+            slug = str(slug).strip()
+            sha = str(sha).strip()
+            if not slug or not sha:
+                continue
+            if only_project and slug != only_project:
+                continue
+            commit_map[slug].add(sha)
+            rows_read += 1
+            if limit and rows_read >= limit:
+                logger.info("Reached limit=%s rows; stopping input read.", limit)
+                return commit_map, rows_read
+    return commit_map, rows_read
+
+
+def process_repo(slug: str, commits: Set[str], args: argparse.Namespace) -> Tuple[str, List[str]]:
+    """
+    Ensure the repo is fetched and return commits that are missing locally.
+    If fetching fails, the repo is skipped to avoid false positives.
+    """
+    repo_dir = ensure_repo(slug, args.repos_dir)
+    if repo_dir is None:
+        return slug, []
+
+    fetched = fetch_repo(slug, repo_dir, args.fetch_depth)
+    if not fetched:
+        return slug, []
+
+    missing = [sha for sha in commits if not commit_exists(repo_dir, sha)]
+    return slug, missing
+
+
+def write_missing(rows: Iterable[Tuple[str, str]], output_path: Path) -> None:
+    """Write missing commits to CSV with headers."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["gh_project_name", "git_trigger_commit"])
+        for slug, sha in rows:
+            writer.writerow([slug, sha])
+
+
+def main() -> None:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+
+    if not args.input.exists():
+        raise SystemExit(f"Input file not found: {args.input}")
+
+    output_path = args.output or args.input.with_name(f"{args.input.name}.missing-commits.csv")
+    logger.info("Reading %s", args.input)
+    commit_map, rows_read = load_commit_map(args.input, args.chunk_size, args.limit, args.only_project)
+    logger.info("Collected %s unique repositories from %s rows", len(commit_map), rows_read)
+
+    if not commit_map:
+        logger.warning("No repositories to process. Check filters or input columns.")
+        return
+
+    results: List[Tuple[str, str]] = []
+    total_repos = len(commit_map)
+    processed = 0
+
+    # Process repos in a bounded thread pool; tune max_workers to avoid overwhelming GitHub.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
+        future_to_slug = {
+            executor.submit(process_repo, slug, commits, args): slug
+            for slug, commits in commit_map.items()
+        }
+        for future in as_completed(future_to_slug):
+            slug = future_to_slug[future]
+            try:
+                repo_slug, missing = future.result()
+            except Exception as exc:  # Defensive: keep going on a single repo failure
+                logger.warning("Error while processing %s: %s", slug, exc)
+                missing = []
+                repo_slug = slug
+
+            processed += 1
+            if missing:
+                results.extend((repo_slug, sha) for sha in sorted(missing))
+            if processed % 10 == 0 or processed == total_repos:
+                logger.info("Processed %s/%s repos (missing commits so far: %s)", processed, total_repos, len(results))
+
+    # Sort results for stable output
+    results.sort()
+    write_missing(results, output_path)
+    logger.info("Wrote %s missing commit rows to %s", len(results), output_path)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user.")
+        sys.exit(1)

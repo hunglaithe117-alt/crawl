@@ -8,6 +8,7 @@ import subprocess
 import re
 import glob
 import argparse
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from datetime import datetime, timedelta
@@ -488,75 +489,116 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
 # --- Pipeline Logic ---
 
 
-def process_project_group(
-    project_name, group, config, token_manager, repos_dir, executor, cleanup=True
-):
-    """
-    Process a group of rows belonging to the same project.
-    """
-    if pd.isna(project_name):
-        return group, []
-
-    logger.info(f"[{project_name}] Processing {len(group)} rows")
-
+def prepare_project_context(project_name, config, token_manager, repos_dir):
     owner, repo = project_name.split("/")
-    client = GitHubAPIClient(
-        owner,
-        repo,
-        token_manager=token_manager,
-        retry_count=config.get("github_api_retry_count", 5),
-        retry_delay=config.get("github_api_retry_delay", 1.0),
-        cache_dir=config.get("github_api_cache_dir", None),
-    )
-
-    repo_url = f"https://github.com/{project_name}.git"
     repo_dir = os.path.join(repos_dir, f"{owner}_{repo}")
+    repo_url = f"https://github.com/{project_name}.git"
 
-    try:
-        clone_repo(repo_url, repo_dir)
+    ctx = {
+        "client": GitHubAPIClient(
+            owner,
+            repo,
+            token_manager=token_manager,
+            retry_count=config.get("github_api_retry_count", 5),
+            retry_delay=config.get("github_api_retry_delay", 1.0),
+            cache_dir=config.get("github_api_cache_dir", None),
+        ),
+        "repo_dir": repo_dir,
+        "cleanup": False,
+    }
 
-        missing_logs = []
+    has_repo = clone_repo(repo_url, repo_dir)
+    if not has_repo:
+        logger.warning(f"[{project_name}] Failed to clone, will use API fallback")
+    else:
+        ctx["cleanup"] = True
 
-        # 1. PR Features
-        unique_prs = group[group["gh_is_pr"]]["gh_pull_req_num"].unique()
+    return ctx
+
+
+def apply_feature_caches(group, pr_features_cache, commit_features_cache):
+    applied_pr_features = 0
+    applied_commit_features = 0
+
+    if pr_features_cache:
+        pr_df = pd.DataFrame.from_dict(pr_features_cache, orient="index")
+        group["_tmp_pr_key"] = group["gh_pull_req_num"].fillna(-1).astype(int)
+
+        for col in pr_df.columns:
+            mapped = group["_tmp_pr_key"].map(pr_df[col])
+            if col not in group.columns:
+                group[col] = None
+            group[col] = group[col].fillna(mapped).infer_objects(copy=False)
+
+        if "gh_num_reviewers" in pr_df.columns:
+            applied_pr_features = group["_tmp_pr_key"].isin(pr_df.index).sum()
+
+        group.drop(columns=["_tmp_pr_key"], inplace=True)
+
+    if commit_features_cache:
+        commit_df = pd.DataFrame.from_dict(commit_features_cache, orient="index")
+
+        for col in commit_df.columns:
+            mapped = group["git_trigger_commit"].map(commit_df[col])
+            if col not in group.columns:
+                group[col] = None
+            group[col] = group[col].fillna(mapped).infer_objects(copy=False)
+
+        applied_commit_features = (
+            group["git_trigger_commit"].isin(commit_df.index).sum()
+        )
+
+    return group, applied_pr_features, applied_commit_features
+
+
+def process_batch(
+    batch_df, config, token_manager, repos_dir, executor, projects_to_keep=None
+):
+    logger.info(f"Processing batch: rows={len(batch_df)}")
+    project_groups = []
+    for name, group in batch_df.groupby("gh_project_name"):
+        if pd.isna(name):
+            logger.warning("Skipping rows with missing project name")
+            continue
+        project_groups.append((name, group))
+    logger.info(f"Batch contains {len(project_groups)} projects to process")
+
+    projects_to_keep = projects_to_keep or set()
+    project_contexts = {
+        name: prepare_project_context(name, config, token_manager, repos_dir)
+        for name, _ in project_groups
+    }
+
+    pr_futures = {}
+    commit_futures = {}
+
+    for project_name, group in project_groups:
+        ctx = project_contexts[project_name]
+        client = ctx["client"]
+        repo_dir = ctx.get("repo_dir")
+
+        unique_prs = (
+            group[group["gh_is_pr"]]["gh_pull_req_num"].dropna().unique().tolist()
+        )
         logger.info(f"[{project_name}] Found {len(unique_prs)} unique PRs to fetch")
-        pr_features_cache = {}
+        for pr_num in unique_prs:
+            representative_row = group[group["gh_pull_req_num"] == pr_num].iloc[0]
+            future = executor.submit(
+                get_pr_features, client, int(pr_num), representative_row
+            )
+            pr_futures[future] = (project_name, int(pr_num))
 
-        future_to_pr = {
-            executor.submit(
-                get_pr_features,
-                client,
-                int(pr_num),
-                group[group["gh_pull_req_num"] == pr_num].iloc[0],
-            ): int(pr_num)
-            for pr_num in unique_prs
-            if not pd.isna(pr_num)
-        }
-        for future in as_completed(future_to_pr):
-            pr_num = future_to_pr[future]
-            try:
-                pr_features_cache[pr_num] = future.result()
-            except Exception as e:
-                logger.error(f"PR fetch failed: {e}")
-
-        # 2. Commit Features
-        unique_commits = group["git_trigger_commit"].unique()
+        unique_commits = group["git_trigger_commit"].dropna().unique().tolist()
         logger.info(
             f"[{project_name}] Found {len(unique_commits)} unique commits to fetch"
         )
-        commit_features_cache = {}
-
-        future_to_sha = {}
         for commit_sha in unique_commits:
-            if pd.isna(commit_sha):
-                continue
             rep_row = group[group["git_trigger_commit"] == commit_sha].iloc[0]
             git_all_built_commits = (
                 str(rep_row["git_all_built_commits"]).split("#")
                 if not pd.isna(rep_row["git_all_built_commits"])
                 else []
             )
-
             future = executor.submit(
                 get_commit_features,
                 client,
@@ -565,86 +607,50 @@ def process_project_group(
                 repo_dir,
                 rep_row,
             )
-            future_to_sha[future] = commit_sha
+            commit_futures[future] = (project_name, commit_sha)
 
-        for future in as_completed(future_to_sha):
-            commit_sha = future_to_sha[future]
-            try:
-                feats, log = future.result()
-                if log:
-                    missing_logs.append(log)
-                if feats is None:
-                    continue
-                commit_features_cache[commit_sha] = feats
-            except Exception as e:
-                logger.error(f"Commit fetch failed: {e}")
+    pr_features_cache = defaultdict(dict)
+    for future in as_completed(pr_futures):
+        project_name, pr_num = pr_futures[future]
+        try:
+            pr_features_cache[project_name][pr_num] = future.result()
+        except Exception as e:
+            logger.error(f"[{project_name}] PR fetch failed: {e}")
 
-        # 3. Apply (Vectorized)
-        applied_pr_features = 0
-        if pr_features_cache:
-            pr_df = pd.DataFrame.from_dict(pr_features_cache, orient="index")
-            # Ensure index is compatible with gh_pull_req_num (which might be float/int)
-            # We'll map using the index.
+    commit_features_cache = defaultdict(dict)
+    all_missing_logs = []
+    for future in as_completed(commit_futures):
+        project_name, commit_sha = commit_futures[future]
+        try:
+            feats, log = future.result()
+            if log:
+                all_missing_logs.append(log)
+            if feats is None:
+                continue
+            commit_features_cache[project_name][commit_sha] = feats
+        except Exception as e:
+            logger.error(f"[{project_name}] Commit fetch failed: {e}")
 
-            # Create a temporary series for mapping to handle potential float/int mismatch
-            # We cast the key column in group to numeric, fillna, convert to int for mapping
-            # But simpler: just ensure pr_df index matches what's in gh_pull_req_num (floats if NaN exists)
-
-            # Actually, safest is to map on the values we know are keys.
-            # group['gh_pull_req_num'] has NaNs.
-
-            # Let's use a temporary column for mapping key
-            group["_tmp_pr_key"] = group["gh_pull_req_num"].fillna(-1).astype(int)
-
-            for col in pr_df.columns:
-                # Map values from pr_df to group
-                # pr_df index is int (pr_num)
-                mapped = group["_tmp_pr_key"].map(pr_df[col])
-
-                # Only update where we have a match (mapped is not NaN) AND it's a PR row
-                # But map will return NaN if key not found.
-                # We should only update if row['gh_is_pr'] is True?
-                # The cache only contains PRs we fetched.
-
-                # Update group[col]
-                # We use combine_first to keep existing non-null values if any (though usually they are null)
-                # Or just direct assignment where not null?
-                # group[col] = group[col].fillna(mapped) # This fills NaNs in group with mapped values
-
-                # Let's use update or fillna. Since we initialized cols to None, fillna is good.
-                if col not in group.columns:
-                    group[col] = None
-                group[col] = group[col].fillna(mapped).infer_objects(copy=False)
-
-            # Count how many rows got updated (approximate, based on one column like gh_num_reviewers)
-            if "gh_num_reviewers" in pr_df.columns:
-                applied_pr_features = group["_tmp_pr_key"].isin(pr_df.index).sum()
-
-            group.drop(columns=["_tmp_pr_key"], inplace=True)
-
-        applied_commit_features = 0
-        if commit_features_cache:
-            commit_df = pd.DataFrame.from_dict(commit_features_cache, orient="index")
-
-            for col in commit_df.columns:
-                mapped = group["git_trigger_commit"].map(commit_df[col])
-                if col not in group.columns:
-                    group[col] = None
-                group[col] = group[col].fillna(mapped).infer_objects(copy=False)
-
-            # Count applied
-            applied_commit_features = (
-                group["git_trigger_commit"].isin(commit_df.index).sum()
-            )
-
-        logger.info(
-            f"[{project_name}] Applied PR features: {applied_pr_features} (rows), Commit features: {applied_commit_features} (rows)"
+    results = []
+    for project_name, group in project_groups:
+        processed_group, applied_pr, applied_commit = apply_feature_caches(
+            group.copy(),
+            pr_features_cache.get(project_name, {}),
+            commit_features_cache.get(project_name, {}),
         )
-        return group, missing_logs
+        logger.info(
+            f"[{project_name}] Applied PR features: {applied_pr} (rows), Commit features: {applied_commit} (rows)"
+        )
+        results.append(processed_group)
 
-    finally:
-        # Cleanup repo to save space
-        if cleanup and os.path.exists(repo_dir):
+    for project_name, ctx in project_contexts.items():
+        repo_dir = ctx.get("repo_dir")
+        if (
+            ctx.get("cleanup")
+            and repo_dir
+            and os.path.exists(repo_dir)
+            and project_name not in projects_to_keep
+        ):
             try:
                 shutil.rmtree(repo_dir)
                 logger.info(f"[{project_name}] Cleaned up repo at {repo_dir}")
@@ -652,39 +658,6 @@ def process_project_group(
                 logger.warning(
                     f"[{project_name}] Failed to cleanup repo at {repo_dir}: {e}"
                 )
-
-
-def process_batch(
-    batch_df, config, token_manager, repos_dir, executor, projects_to_keep=None
-):
-    logger.info(f"Processing batch: rows={len(batch_df)}")
-    # Group by project within the batch
-    grouped = batch_df.groupby("gh_project_name")
-    try:
-        project_count = len(list(grouped))
-    except Exception:
-        project_count = None
-    logger.info(f"Batch contains {project_count} projects to process")
-    results = []
-    all_missing_logs = []
-
-    # Process each project in the batch
-    # We could parallelize this loop too, but let's keep it simple:
-    # Parallelism is inside process_project_group (fetching PRs/Commits).
-    projects_to_keep = projects_to_keep or set()
-    for project_name, group in grouped:
-        should_cleanup = project_name not in projects_to_keep
-        processed_group, logs = process_project_group(
-            project_name,
-            group.copy(),
-            config,
-            token_manager,
-            repos_dir,
-            executor,
-            cleanup=should_cleanup,
-        )
-        results.append(processed_group)
-        all_missing_logs.extend(logs)
 
     if results:
         return pd.concat(results), all_missing_logs

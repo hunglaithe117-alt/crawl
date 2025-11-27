@@ -166,6 +166,37 @@ def get_build_time(row, repo_dir, commit_sha, client):
     return build_time
 
 
+def build_author_first_commit_map(repo_dir):
+    """
+    Build a lookup of author name -> oldest commit timestamp once per repo to avoid
+    running git log for every row.
+    """
+    author_first_commit = {}
+    if not repo_dir or not os.path.exists(repo_dir):
+        return author_first_commit
+
+    try:
+        cmd = ["git", "log", "--all", "--format=%an%x09%ct"]
+        output = subprocess.check_output(
+            cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
+        )
+        for line in output.splitlines():
+            if "\t" not in line:
+                continue
+            author, ts_str = line.split("\t", 1)
+            try:
+                ts = int(ts_str.strip())
+            except ValueError:
+                continue
+            prev = author_first_commit.get(author)
+            if prev is None or ts < prev:
+                author_first_commit[author] = ts
+    except Exception:
+        pass
+
+    return author_first_commit
+
+
 def calculate_build_hour_risk(build_time):
     if not build_time:
         return None, None, None
@@ -189,8 +220,11 @@ def calculate_build_hour_risk(build_time):
     return risk_score, sin_time, cos_time
 
 
-def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
+def check_is_new_contributor(
+    repo_dir, commit_sha, build_time, client, author_first_commit_map=None
+):
     is_new_contributor = None
+    author = None
 
     # Try Git First
     if repo_dir and os.path.exists(repo_dir):
@@ -200,7 +234,18 @@ def check_is_new_contributor(repo_dir, commit_sha, build_time, client):
                 cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
             ).strip()
 
-            if author:
+            if author and author_first_commit_map:
+                first_ts = author_first_commit_map.get(author)
+                if first_ts is not None:
+                    current_ts = (
+                        int(build_time.timestamp())
+                        if build_time
+                        else int(datetime.now().timestamp())
+                    )
+                    diff_days = (current_ts - first_ts) / (3600 * 24)
+                    is_new_contributor = 1 if diff_days < 90 else 0
+
+            if is_new_contributor is None and author:
                 # Use git log --reverse to find the oldest commit.
                 # Do NOT use -n 1 with --reverse as it filters first then reverses (showing the newest).
                 # We want the oldest, so we list all (or use rev-list) and take the first.
@@ -380,7 +425,7 @@ def calculate_change_entropy_feature(
     return None, "Entropy failed: Unknown error"
 
 
-def get_risk_features(row, repo_dir, client=None):
+def get_risk_features(row, repo_dir, client=None, author_first_commit_map=None):
     features = {}
 
     commit_sha = row["git_trigger_commit"]
@@ -413,7 +458,11 @@ def get_risk_features(row, repo_dir, client=None):
 
     # 4. Is New Contributor
     is_new_contributor, error_reason = check_is_new_contributor(
-        repo_dir, commit_sha, build_time, client
+        repo_dir,
+        commit_sha,
+        build_time,
+        client,
+        author_first_commit_map or {},
     )
     if error_reason:
         return features, (build_id, project_name, commit_sha, error_reason)
@@ -430,25 +479,28 @@ def get_risk_features(row, repo_dir, client=None):
     return features, None
 
 
-def process_project_group(
-    project_name, group, repos_dir, config, token_manager, cleanup=True
-):
-    logger.info(f"[{project_name}] Processing {len(group)} rows")
-
+def prepare_project_context(project_name, repos_dir, config, token_manager):
     repo_url = f"https://github.com/{project_name}.git"
     owner, repo = project_name.split("/")
     repo_dir = os.path.join(repos_dir, f"{owner}_{repo}")
 
-    # Clone
+    ctx = {
+        "repo_dir": None,
+        "client": None,
+        "author_first_commit_map": {},
+        "cleanup": False,
+    }
+
     has_repo = clone_repo(repo_url, repo_dir)
     if not has_repo:
         logger.warning(f"[{project_name}] Failed to clone, will use API fallback")
-        repo_dir = None
+    else:
+        ctx["repo_dir"] = repo_dir
+        ctx["cleanup"] = True
+        ctx["author_first_commit_map"] = build_author_first_commit_map(repo_dir)
 
-    # Initialize Client if needed
-    client = None
     if GitHubAPIClient and token_manager:
-        client = GitHubAPIClient(
+        ctx["client"] = GitHubAPIClient(
             owner,
             repo,
             token_manager=token_manager,
@@ -456,66 +508,71 @@ def process_project_group(
             retry_delay=config.get("github_api_retry_delay", 1.0),
         )
 
-    results = []
-    missing_logs = []
-    total_rows = len(group)
+    return ctx
 
-    for idx, (index, row) in enumerate(group.iterrows()):
-        commit_sha = row["git_trigger_commit"]
-        logger.info(
-            f"[{project_name}] Processing commit {commit_sha} ({idx + 1}/{total_rows})"
-        )
 
-        feats, log = get_risk_features(row, repo_dir, client)
-        if log:
-            missing_logs.append(log)
-            continue  # Skip this row if enrichment failed
+def process_commit_row(row, project_name, repo_ctx):
+    commit_sha = row["git_trigger_commit"]
+    logger.info(f"[{project_name}] Processing commit {commit_sha}")
 
-        # Merge features into row
-        for k, v in feats.items():
-            row[k] = v
-        results.append(row)
+    feats, log = get_risk_features(
+        row,
+        repo_ctx.get("repo_dir"),
+        repo_ctx.get("client"),
+        repo_ctx.get("author_first_commit_map"),
+    )
+    if log:
+        return None, log
 
-    # Cleanup
-    if cleanup and repo_dir and os.path.exists(repo_dir):
-        try:
-            shutil.rmtree(repo_dir)
-        except Exception:
-            pass
-
-    return pd.DataFrame(results), missing_logs
+    for k, v in feats.items():
+        row[k] = v
+    return row, None
 
 
 def process_batch(batch_df, config, token_manager, repos_dir, executor):
-    grouped = batch_df.groupby("gh_project_name")
-    project_groups = [group for _, group in grouped]
+    project_groups = []
+    for name, group in batch_df.groupby("gh_project_name"):
+        if pd.isna(name):
+            logger.warning("Skipping rows with missing project name")
+            continue
+        project_groups.append((name, group))
+    project_contexts = {
+        name: prepare_project_context(name, repos_dir, config, token_manager)
+        for name, _ in project_groups
+    }
 
     results = []
     all_missing_logs = []
+    future_to_project = {}
 
-    future_to_project = {
-        executor.submit(
-            process_project_group,
-            group["gh_project_name"].iloc[0],
-            group,
-            repos_dir,
-            config,
-            token_manager,
-        ): i
-        for i, group in enumerate(project_groups)
-    }
+    for project_name, group in project_groups:
+        repo_ctx = project_contexts[project_name]
+        for _, row in group.iterrows():
+            future = executor.submit(
+                process_commit_row, row.copy(), project_name, repo_ctx
+            )
+            future_to_project[future] = project_name
 
     for future in as_completed(future_to_project):
         try:
-            res_df, logs = future.result()
-            results.append(res_df)
-            if logs:
-                all_missing_logs.extend(logs)
+            row_result, log = future.result()
+            if log:
+                all_missing_logs.append(log)
+            elif row_result is not None:
+                results.append(row_result)
         except Exception as e:
-            logger.error(f"Project failed: {e}")
+            logger.error(f"Commit task failed: {e}")
+
+    for ctx in project_contexts.values():
+        repo_dir = ctx.get("repo_dir")
+        if ctx.get("cleanup") and repo_dir and os.path.exists(repo_dir):
+            try:
+                shutil.rmtree(repo_dir)
+            except Exception:
+                pass
 
     if results:
-        return pd.concat(results), all_missing_logs
+        return pd.DataFrame(results), all_missing_logs
     return pd.DataFrame(), all_missing_logs
 
 

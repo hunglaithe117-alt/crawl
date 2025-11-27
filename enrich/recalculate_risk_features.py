@@ -340,28 +340,28 @@ def get_risk_features_with_cache(
     return features, None
 
 
-def process_project_group(
-    project_name, group, repos_dir, config, token_manager, cleanup=True
-):
-    logger.info(f"[{project_name}] Processing {len(group)} rows")
-
+def prepare_project_context(project_name, repos_dir, config, token_manager):
     repo_url = f"https://github.com/{project_name}.git"
     owner, repo = project_name.split("/")
     repo_dir = os.path.join(repos_dir, f"{owner}_{repo}")
 
-    # Clone
+    ctx = {
+        "repo_dir": None,
+        "client": None,
+        "author_first_commit_map": {},
+        "cleanup": False,
+    }
+
     has_repo = clone_repo(repo_url, repo_dir)
     if not has_repo:
         logger.warning(f"[{project_name}] Failed to clone, will use API fallback")
-        repo_dir = None
-        author_first_commit_map = {}
     else:
-        author_first_commit_map = build_author_first_commit_map(repo_dir)
+        ctx["repo_dir"] = repo_dir
+        ctx["cleanup"] = True
+        ctx["author_first_commit_map"] = build_author_first_commit_map(repo_dir)
 
-    # Initialize Client if needed
-    client = None
     if GitHubAPIClient and token_manager:
-        client = GitHubAPIClient(
+        ctx["client"] = GitHubAPIClient(
             owner,
             repo,
             token_manager=token_manager,
@@ -369,68 +369,68 @@ def process_project_group(
             retry_delay=config.get("github_api_retry_delay", 1.0),
         )
 
-    results = []
-    missing_logs = []
-    total_rows = len(group)
+    return ctx
 
-    for idx, (index, row) in enumerate(group.iterrows()):
-        commit_sha = row["git_trigger_commit"]
-        logger.info(
-            f"[{project_name}] Processing commit {commit_sha} ({idx + 1}/{total_rows})"
-        )
 
-        feats, log = get_risk_features_with_cache(
-            row, repo_dir, client, author_first_commit_map
-        )
-        if log:
-            missing_logs.append(log)
-            continue  # Skip this row if enrichment failed
+def process_commit_row(row, project_name, repo_ctx):
+    commit_sha = row["git_trigger_commit"]
+    logger.info(f"[{project_name}] Processing commit {commit_sha}")
 
-        # Merge features into row
-        for k, v in feats.items():
-            row[k] = v
-        results.append(row)
+    feats, log = get_risk_features_with_cache(
+        row,
+        repo_ctx.get("repo_dir"),
+        repo_ctx.get("client"),
+        repo_ctx.get("author_first_commit_map"),
+    )
+    if log:
+        return None, log
 
-    # Cleanup
-    if cleanup and repo_dir and os.path.exists(repo_dir):
-        try:
-            shutil.rmtree(repo_dir)
-        except Exception:
-            pass
-
-    return pd.DataFrame(results), missing_logs
+    for k, v in feats.items():
+        row[k] = v
+    return row, None
 
 
 def process_batch(batch_df, config, token_manager, repos_dir, executor):
-    grouped = batch_df.groupby("gh_project_name")
-    project_groups = [group for _, group in grouped]
+    project_groups = [
+        (name, group) for name, group in batch_df.groupby("gh_project_name")
+    ]
+    project_contexts = {
+        name: prepare_project_context(name, repos_dir, config, token_manager)
+        for name, _ in project_groups
+    }
 
     results = []
     all_missing_logs = []
+    future_to_project = {}
 
-    future_to_project = {
-        executor.submit(
-            process_project_group,
-            group["gh_project_name"].iloc[0],
-            group,
-            repos_dir,
-            config,
-            token_manager,
-        ): i
-        for i, group in enumerate(project_groups)
-    }
+    for project_name, group in project_groups:
+        repo_ctx = project_contexts[project_name]
+        for _, row in group.iterrows():
+            future = executor.submit(
+                process_commit_row, row.copy(), project_name, repo_ctx
+            )
+            future_to_project[future] = project_name
 
     for future in as_completed(future_to_project):
         try:
-            res_df, logs = future.result()
-            results.append(res_df)
-            if logs:
-                all_missing_logs.extend(logs)
+            row_result, log = future.result()
+            if log:
+                all_missing_logs.append(log)
+            elif row_result is not None:
+                results.append(row_result)
         except Exception as e:
-            logger.error(f"Project failed: {e}")
+            logger.error(f"Commit task failed: {e}")
+
+    for ctx in project_contexts.values():
+        repo_dir = ctx.get("repo_dir")
+        if ctx.get("cleanup") and repo_dir and os.path.exists(repo_dir):
+            try:
+                shutil.rmtree(repo_dir)
+            except Exception:
+                pass
 
     if results:
-        return pd.concat(results), all_missing_logs
+        return pd.DataFrame(results), all_missing_logs
     return pd.DataFrame(), all_missing_logs
 
 
