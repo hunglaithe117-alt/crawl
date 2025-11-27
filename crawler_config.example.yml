@@ -12,5 +12,6 @@ retry_base_delay_seconds: 0.1
 
 github_api_retry_count: 5
 github_api_retry_delay: 1.0
+github_api_cache_dir: /tmp/github_api_cache
 
 github_api_url: "https://api.github.com"
