@@ -506,6 +506,7 @@ def process_project_group(
         token_manager=token_manager,
         retry_count=config.get("github_api_retry_count", 5),
         retry_delay=config.get("github_api_retry_delay", 1.0),
+        cache_dir=config.get("github_api_cache_dir", None),
     )
 
     repo_url = f"https://github.com/{project_name}.git"
