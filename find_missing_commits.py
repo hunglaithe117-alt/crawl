@@ -7,6 +7,7 @@ For each unique (gh_project_name, git_trigger_commit) pair the script:
 2. Fetches branches, tags, and pull request refs (refs/pull/*/{head,merge}).
 3. Marks a commit as "missing" if `git cat-file -e <sha>^{commit}` fails after the fetch.
 4. Removes the local bare repo after processing each project (use --keep-repos to skip).
+5. Streams results directly to disk to keep RAM usage low.
 
 The output is a small CSV with two columns: gh_project_name, git_trigger_commit.
 """
@@ -21,7 +22,7 @@ import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -207,35 +208,28 @@ def load_commit_map(
     return commit_map, rows_read
 
 
-def process_repo(slug: str, commits: Set[str], args: argparse.Namespace) -> Tuple[str, List[str]]:
+def process_repo(slug: str, commits: Set[str], args: argparse.Namespace) -> Tuple[str, List[str], str]:
     """
     Ensure the repo is fetched and return commits that are missing locally.
-    If fetching fails, the repo is skipped to avoid false positives.
+    If fetching fails, the repo is skipped to avoid false positives. Status indicates success/failure reason.
     """
     repo_dir = ensure_repo(slug, args.repos_dir)
     if repo_dir is None:
-        return slug, []
+        return slug, [], "init_failed"
 
     missing: List[str] = []
+    status = "ok"
     try:
         fetched = fetch_repo(slug, repo_dir, args.fetch_depth)
-        if fetched:
+        if not fetched:
+            status = "fetch_failed"
+        else:
             missing = [sha for sha in commits if not commit_exists(repo_dir, sha)]
     finally:
         if not args.keep_repos:
             cleanup_repo(repo_dir)
 
-    return slug, missing
-
-
-def write_missing(rows: Iterable[Tuple[str, str]], output_path: Path) -> None:
-    """Write missing commits to CSV with headers."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(["gh_project_name", "git_trigger_commit"])
-        for slug, sha in rows:
-            writer.writerow([slug, sha])
+    return slug, missing, status
 
 
 def main() -> None:
@@ -257,37 +251,58 @@ def main() -> None:
         logger.warning("No repositories to process. Check filters or input columns.")
         return
 
-    results: List[Tuple[str, str]] = []
     total_repos = len(commit_map)
     processed = 0
+    missing_count = 0
+    failed_repos: List[Tuple[str, str]] = []  # (slug, reason)
 
-    # Process repos in a bounded thread pool; tune max_workers to avoid overwhelming GitHub.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    # Prepare output writer (streaming to avoid large memory use)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["gh_project_name", "git_trigger_commit"])
 
-    with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
-        future_to_slug = {
-            executor.submit(process_repo, slug, commits, args): slug
-            for slug, commits in commit_map.items()
-        }
-        for future in as_completed(future_to_slug):
-            slug = future_to_slug[future]
-            try:
-                repo_slug, missing = future.result()
-            except Exception as exc:  # Defensive: keep going on a single repo failure
-                logger.warning("Error while processing %s: %s", slug, exc)
-                missing = []
-                repo_slug = slug
+        # Process repos in a bounded thread pool; tune max_workers to avoid overwhelming GitHub.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            processed += 1
-            if missing:
-                results.extend((repo_slug, sha) for sha in sorted(missing))
-            if processed % 10 == 0 or processed == total_repos:
-                logger.info("Processed %s/%s repos (missing commits so far: %s)", processed, total_repos, len(results))
+        with ThreadPoolExecutor(max_workers=max(1, args.max_workers)) as executor:
+            future_to_slug = {
+                executor.submit(process_repo, slug, commits, args): slug
+                for slug, commits in commit_map.items()
+            }
+            for future in as_completed(future_to_slug):
+                slug = future_to_slug[future]
+                try:
+                    repo_slug, missing, status = future.result()
+                except Exception as exc:  # Defensive: keep going on a single repo failure
+                    logger.warning("Error while processing %s: %s", slug, exc)
+                    missing = []
+                    repo_slug = slug
+                    status = "exception"
 
-    # Sort results for stable output
-    results.sort()
-    write_missing(results, output_path)
-    logger.info("Wrote %s missing commit rows to %s", len(results), output_path)
+                processed += 1
+
+                if status != "ok":
+                    failed_repos.append((repo_slug, status))
+                    logger.warning("Skipping %s due to %s", repo_slug, status)
+
+                if missing:
+                    for sha in sorted(missing):
+                        writer.writerow([repo_slug, sha])
+                        missing_count += 1
+                    handle.flush()
+
+                if processed % 10 == 0 or processed == total_repos:
+                    logger.info(
+                        "Processed %s/%s repos (missing commits so far: %s)",
+                        processed,
+                        total_repos,
+                        missing_count,
+                    )
+
+    if failed_repos:
+        logger.warning("Failed to clone/fetch %s repos: %s", len(failed_repos), failed_repos)
+    logger.info("Finished. Missing commits written: %s -> %s", missing_count, output_path)
 
 
 if __name__ == "__main__":
