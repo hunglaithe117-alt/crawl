@@ -373,6 +373,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume from checkpoint; appends to outputs instead of overwriting.",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level",
+    )
     return parser.parse_args()
 
 
@@ -444,10 +450,13 @@ def main() -> None:
     args = parse_args()
     args = resolve_settings(args)
 
+    log_level = getattr(logging, str(args.log_level).upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.INFO,
+        level=log_level,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
+    logging.getLogger().setLevel(log_level)
+    logger.info("Logging level set to %s", logging.getLevelName(log_level))
 
     if not args.input:
         raise SystemExit("Please provide --input path to the CSV.")
