@@ -341,7 +341,8 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     for sha in git_all_built_commits:
         try:
             # Get author, timestamp, and files
-            cmd = ["git", "show", "--name-only", "--format=%an%n%ct", sha]
+            # Added -m to handle merge commits correctly
+            cmd = ["git", "show", "-m", "--name-only", "--format=%an%n%ct", sha]
             output = subprocess.check_output(
                 cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
             ).splitlines()

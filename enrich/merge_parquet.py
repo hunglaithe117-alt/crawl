@@ -60,7 +60,7 @@ def merge_results(output_dir):
         # We pass the list of files to read_parquet
         files_sql = ", ".join([f"'{f}'" for f in valid_files])
         con.execute(
-            f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet([{files_sql}])"
+            f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
         )
 
         # Output directory for merged files

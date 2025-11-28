@@ -107,7 +107,6 @@ def get_git_commit_date(repo_dir, commit_sha):
 def calculate_entropy(file_changes):
     """
     Calculates Shannon entropy of changes across files.
-    file_changes: list of integers (lines changed per file)
     """
     total_changes = sum(file_changes)
     if total_changes == 0:
