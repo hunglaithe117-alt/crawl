@@ -5,17 +5,15 @@ import pandas as pd
 import duckdb
 import yaml
 import subprocess
-import re
 import glob
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
 from datetime import datetime, timedelta
 import shutil
+from tqdm import tqdm
 
-
-# Add parent directory to path to import github_api_client and token_pool
+# Add parent directory to path to import shared clients
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from github_api_client import GitHubAPIClient
 from token_pool import TokenManager
@@ -30,15 +28,12 @@ class TqdmLoggingHandler(logging.Handler):
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Use tqdm.write which writes to stderr but keeps progress bar state intact
             tqdm.write(msg)
             self.flush()
         except Exception:
             self.handleError(record)
 
 
-# Setup logging
-# Use a tqdm-aware handler and force override existing logging config (eg. uvicorn)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -54,12 +49,11 @@ def load_config(config_path):
         with open(config_path, "r") as f:
             cfg = yaml.safe_load(f)
 
-        # Load tokens from tokens.yml if it exists and merge
-        BASE_DIR = os.path.dirname(config_path)
-        TOKENS_PATH = os.path.join(BASE_DIR, "tokens.yml")
-        if os.path.exists(TOKENS_PATH):
+        base_dir = os.path.dirname(config_path)
+        tokens_path = os.path.join(base_dir, "tokens.yml")
+        if os.path.exists(tokens_path):
             try:
-                with open(TOKENS_PATH, "r") as f_tokens:
+                with open(tokens_path, "r") as f_tokens:
                     tokens_config = yaml.safe_load(f_tokens) or {}
                     if "github_tokens" in tokens_config:
                         cfg.setdefault("github_tokens", []).extend(
@@ -69,9 +63,9 @@ def load_config(config_path):
                         cfg.setdefault("travis_tokens", []).extend(
                             tokens_config["travis_tokens"]
                         )
-                logger.info(f"Loaded and merged tokens from {TOKENS_PATH}")
+                logger.info(f"Loaded and merged tokens from {tokens_path}")
             except Exception as e:
-                logger.warning(f"Failed to load tokens from {TOKENS_PATH}: {e}")
+                logger.warning(f"Failed to load tokens from {tokens_path}: {e}")
 
         logger.debug(
             f"Loaded config keys: {list(cfg.keys()) if isinstance(cfg, dict) else 'N/A'}"
@@ -79,76 +73,8 @@ def load_config(config_path):
         return cfg
     except Exception as e:
         logger.error(f"Failed to load config from {config_path}: {e}")
-        # Fallback to empty config if optional, or raise
-        # For Cloud Run, we might rely on Env Vars entirely
-        logger.warning(
-            "Config file load failed, proceeding with Env Vars if available."
-        )
+        logger.warning("Config file load failed, proceeding with Env Vars if available.")
         return {}
-
-
-def parse_linked_issues(pr_body):
-    logger.debug(
-        f"parse_linked_issues called; body_len={len(pr_body) if pr_body else 0}"
-    )
-    if not pr_body:
-        return 0
-    keywords = [
-        "close",
-        "closes",
-        "closed",
-        "fix",
-        "fixes",
-        "fixed",
-        "resolve",
-        "resolves",
-        "resolved",
-    ]
-    pattern = r"(" + "|".join(keywords) + r")\s+#(\d+)"
-    matches = re.findall(pattern, pr_body, re.IGNORECASE)
-    logger.debug(f"parse_linked_issues found {len(matches)} matches")
-    return len(matches)
-
-
-def calculate_sentiment(text):
-    logger.debug(f"calculate_sentiment called; text_len={len(text) if text else 0}")
-    if not text:
-        return 0
-    text = text.lower()
-    positive = [
-        "good",
-        "great",
-        "awesome",
-        "excellent",
-        "lgtm",
-        "looks good",
-        "perfect",
-        "nice",
-        "thank",
-        "approved",
-    ]
-    negative = [
-        "bad",
-        "wrong",
-        "error",
-        "bug",
-        "fix",
-        "issue",
-        "problem",
-        "change",
-        "concern",
-        "reject",
-        "request changes",
-    ]
-    score = 0
-    for w in positive:
-        if w in text:
-            score += 1
-    for w in negative:
-        if w in text:
-            score -= 1
-    logger.debug(f"calculate_sentiment score={score}")
-    return score
 
 
 def clone_repo(repo_url, clone_dir):
@@ -171,134 +97,11 @@ def clone_repo(repo_url, clone_dir):
     return True
 
 
-def get_pr_features(client, pr_number, row):
-    logger.info(f"Fetching PR features for PR #{pr_number} (GraphQL)")
-    features = {}
-
-    query = """
-    query ($owner: String!, $repo: String!, $pr_number: Int!) {
-      repository(owner: $owner, name: $repo) {
-        pullRequest(number: $pr_number) {
-          title
-          body
-          state
-          createdAt
-          closedAt
-          mergedAt
-          labels(first: 100) {
-            nodes {
-              name
-            }
-          }
-          reviewRequests(first: 100) {
-            nodes {
-              requestedReviewer {
-                ... on User {
-                  login
-                }
-              }
-            }
-          }
-          reviews(first: 100) {
-            nodes {
-              state
-              body
-              submittedAt
-              author {
-                login
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-
-    try:
-        data = client.graphql(
-            query,
-            {"owner": client.owner, "repo": client.repo, "pr_number": int(pr_number)},
-        )
-        pr_data = data.get("data", {}).get("repository", {}).get("pullRequest")
-
-        if pr_data:
-            # 1. Reviewers
-            requested_reviewers = pr_data.get("reviewRequests", {}).get("nodes", [])
-            features["gh_num_reviewers"] = len(requested_reviewers)
-
-            # 2. Linked Issues
-            body = pr_data.get("body", "")
-            features["gh_linked_issues_count"] = parse_linked_issues(body)
-
-            # 3. Bug Label
-            labels = pr_data.get("labels", {}).get("nodes", [])
-            has_bug = any(
-                "bug" in lbl["name"].lower() or "fix" in lbl["name"].lower()
-                for lbl in labels
-            )
-            features["gh_has_bug_label"] = has_bug
-            logger.debug(
-                f"PR {pr_number}: reviewers={len(requested_reviewers)}, has_bug_label={has_bug}"
-            )
-
-            # 4. Approvals & Sentiment
-            reviews = pr_data.get("reviews", {}).get("nodes", [])
-            approvals = [r for r in reviews if r["state"] == "APPROVED"]
-            features["gh_num_approvals"] = len(approvals)
-            logger.debug(
-                f"PR {pr_number}: reviews={len(reviews)}, approvals={len(approvals)}"
-            )
-
-            total_sentiment = 0
-            review_count = 0
-            for r in reviews:
-                r_body = r.get("body", "")
-                if r_body:
-                    total_sentiment += calculate_sentiment(r_body)
-                    review_count += 1
-            features["gh_review_sentiment"] = (
-                total_sentiment / review_count if review_count > 0 else 0
-            )
-            logger.debug(
-                f"PR {pr_number}: review_sentiment={features['gh_review_sentiment']}"
-            )
-
-            # 5. Time to First Review
-            try:
-                pr_created_at = pd.to_datetime(row["gh_pr_created_at"])
-                if reviews:
-                    valid_reviews = [r for r in reviews if r.get("submittedAt")]
-                    if valid_reviews:
-                        valid_reviews.sort(key=lambda x: x["submittedAt"])
-                        first_review_at = pd.to_datetime(
-                            valid_reviews[0]["submittedAt"]
-                        )
-
-                        # Normalize timezones
-                        if pr_created_at.tz is None:
-                            pr_created_at = pr_created_at.tz_localize("UTC")
-                        if first_review_at.tz is None:
-                            first_review_at = first_review_at.tz_localize("UTC")
-
-                        diff = (first_review_at - pr_created_at).total_seconds() / 3600
-                        features["gh_time_to_first_review"] = max(0, diff)
-                        logger.debug(
-                            f"PR {pr_number}: time_to_first_review={features['gh_time_to_first_review']} hours"
-                        )
-            except Exception as e:
-                logger.debug(f"Time calc error: {e}")
-                pass
-    except Exception as e:
-        logger.error(f"Error fetching PR {pr_number}: {e}")
-    return features
-
-
 def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row):
     logger.info(f"Fetching commit features for commit {commit_sha}")
     features = {}
     missing_log = None
 
-    # Get trigger commit date for time-based analysis (3 months prior)
     commit_date = None
     commit_ts = None
     try:
@@ -313,7 +116,6 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     except Exception:
         pass
 
-    # Fallback to API if git failed
     if commit_ts is None:
         try:
             logger.info(f"Falling back to API for commit date: {commit_sha}")
@@ -340,8 +142,6 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     )
     for sha in git_all_built_commits:
         try:
-            # Get author, timestamp, and files
-            # Added -m to handle merge commits correctly
             cmd = ["git", "show", "-m", "--name-only", "--format=%an%n%ct", sha]
             output = subprocess.check_output(
                 cmd, cwd=repo_dir, text=True, stderr=subprocess.DEVNULL
@@ -364,13 +164,11 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
                     f"Commit {commit_sha}: git show {sha} found author {author_name} and {len(output)-2} files lines"
                 )
         except subprocess.CalledProcessError:
-            # Fallback to API
             try:
                 commit = client.get_commit(sha)
                 if commit:
                     if "commit" in commit and "author" in commit["commit"]:
                         build_authors_name.add(commit["commit"]["author"]["name"])
-                        # Check date for window
                         if cutoff_ts is not None and commit_ts is not None:
                             c_date_str = commit["commit"]["author"].get("date")
                             if c_date_str:
@@ -396,18 +194,15 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     if not touched_files:
         return features, missing_log
 
-    # File Change Frequency
     commits_on_files = 0
     num_touched_files = len(touched_files)
     if num_touched_files > 0 and "gh_num_commits_on_files_touched" in row:
         val = row["gh_num_commits_on_files_touched"]
         if not pd.isna(val):
             commits_on_files = val
-            # Add built commits in the last 3 months
             commits_on_files += built_commits_in_window
             features["file_change_frequency"] = commits_on_files / num_touched_files
 
-    # Author Ownership
     total_commits_scanned = 0
     owned_commits_count = 0
     target_authors = build_authors_name
@@ -441,7 +236,6 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
                 pass
 
         if not git_success:
-            # Fallback to API
             try:
                 params = {"path": filename}
                 if commit_date:
@@ -469,8 +263,6 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
             except Exception:
                 pass
 
-    # Use commits_on_files as it represents the total activity on these files in the window.
-    # Fallback to total_commits_scanned (from git log) if commits_on_files is 0.
     denominator = commits_on_files if commits_on_files > 0 else total_commits_scanned
 
     logger.debug(
@@ -485,9 +277,6 @@ def get_commit_features(client, commit_sha, git_all_built_commits, repo_dir, row
     if missing_log:
         logger.warning(f"Commit {commit_sha} missing log: {missing_log}")
     return features, missing_log
-
-
-# --- Pipeline Logic ---
 
 
 def prepare_project_context(project_name, config, token_manager, repos_dir):
@@ -517,24 +306,8 @@ def prepare_project_context(project_name, config, token_manager, repos_dir):
     return ctx
 
 
-def apply_feature_caches(group, pr_features_cache, commit_features_cache):
-    applied_pr_features = 0
+def apply_commit_feature_cache(group, commit_features_cache):
     applied_commit_features = 0
-
-    if pr_features_cache:
-        pr_df = pd.DataFrame.from_dict(pr_features_cache, orient="index")
-        group["_tmp_pr_key"] = group["gh_pull_req_num"].fillna(-1).astype(int)
-
-        for col in pr_df.columns:
-            mapped = group["_tmp_pr_key"].map(pr_df[col])
-            if col not in group.columns:
-                group[col] = None
-            group[col] = group[col].fillna(mapped).infer_objects(copy=False)
-
-        if "gh_num_reviewers" in pr_df.columns:
-            applied_pr_features = group["_tmp_pr_key"].isin(pr_df.index).sum()
-
-        group.drop(columns=["_tmp_pr_key"], inplace=True)
 
     if commit_features_cache:
         commit_df = pd.DataFrame.from_dict(commit_features_cache, orient="index")
@@ -549,7 +322,7 @@ def apply_feature_caches(group, pr_features_cache, commit_features_cache):
             group["git_trigger_commit"].isin(commit_df.index).sum()
         )
 
-    return group, applied_pr_features, applied_commit_features
+    return group, applied_commit_features
 
 
 def process_batch(
@@ -570,24 +343,12 @@ def process_batch(
         for name, _ in project_groups
     }
 
-    pr_futures = {}
     commit_futures = {}
 
     for project_name, group in project_groups:
         ctx = project_contexts[project_name]
         client = ctx["client"]
         repo_dir = ctx.get("repo_dir")
-
-        unique_prs = (
-            group[group["gh_is_pr"]]["gh_pull_req_num"].dropna().unique().tolist()
-        )
-        logger.info(f"[{project_name}] Found {len(unique_prs)} unique PRs to fetch")
-        for pr_num in unique_prs:
-            representative_row = group[group["gh_pull_req_num"] == pr_num].iloc[0]
-            future = executor.submit(
-                get_pr_features, client, int(pr_num), representative_row
-            )
-            pr_futures[future] = (project_name, int(pr_num))
 
         unique_commits = group["git_trigger_commit"].dropna().unique().tolist()
         logger.info(
@@ -610,14 +371,6 @@ def process_batch(
             )
             commit_futures[future] = (project_name, commit_sha)
 
-    pr_features_cache = defaultdict(dict)
-    for future in as_completed(pr_futures):
-        project_name, pr_num = pr_futures[future]
-        try:
-            pr_features_cache[project_name][pr_num] = future.result()
-        except Exception as e:
-            logger.error(f"[{project_name}] PR fetch failed: {e}")
-
     commit_features_cache = defaultdict(dict)
     all_missing_logs = []
     for future in as_completed(commit_futures):
@@ -634,13 +387,11 @@ def process_batch(
 
     results = []
     for project_name, group in project_groups:
-        processed_group, applied_pr, applied_commit = apply_feature_caches(
-            group.copy(),
-            pr_features_cache.get(project_name, {}),
-            commit_features_cache.get(project_name, {}),
+        processed_group, applied_commit = apply_commit_feature_cache(
+            group.copy(), commit_features_cache.get(project_name, {})
         )
         logger.info(
-            f"[{project_name}] Applied PR features: {applied_pr} (rows), Commit features: {applied_commit} (rows)"
+            f"[{project_name}] Applied Commit features: {applied_commit} (rows)"
         )
         results.append(processed_group)
 
@@ -666,13 +417,8 @@ def process_batch(
 
 
 def merge_results(output_dir):
-    """
-    Merge all parquet files in output_dir and save as per-project CSVs.
-    Uses DuckDB to process data efficiently without loading everything into memory.
-    """
     logger.info(f"Starting merge process in {output_dir}")
 
-    # List all parquet files
     files = glob.glob(os.path.join(output_dir, "part_*.parquet"))
 
     if not files:
@@ -682,25 +428,20 @@ def merge_results(output_dir):
     logger.info(f"Found {len(files)} parquet files. Processing with DuckDB...")
 
     try:
-        # Use DuckDB to read and group
         con = duckdb.connect(database=":memory:")
 
-        # Register the parquet files as a view
-        # We use a glob pattern to let DuckDB handle the file reading
         parquet_pattern = os.path.join(output_dir, "part_*.parquet")
-        # union_by_name fixes the case where the first file has NULL-typed columns
+        # union_by_name fixes schema mismatches when earlier parts have NULL-typed columns
         con.execute(
             f"CREATE OR REPLACE VIEW all_data AS SELECT * FROM read_parquet('{parquet_pattern}', union_by_name=true)"
         )
 
-        # Output directory for merged files
         merged_dir = os.path.join(output_dir, "merged_results")
         os.makedirs(merged_dir, exist_ok=True)
 
         output_path = os.path.join(merged_dir, "all_enriched_data.csv")
         logger.info(f"Exporting all data to {output_path}")
 
-        # Use DuckDB COPY to write directly to CSV
         query = f"""
             COPY (
                 SELECT * FROM all_data 
@@ -715,21 +456,20 @@ def merge_results(output_dir):
     finally:
         try:
             con.close()
-        except:
+        except Exception:
             pass
 
 
 def main():
-    # Configuration
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    CONFIG_PATH = os.path.join(BASE_DIR, "crawler_config.yml")
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(base_dir, "crawler_config.yml")
 
     parser = argparse.ArgumentParser(
-        description="Optimized GitHub Feature Enrichment Pipeline"
+        description="GitHub commit feature enrichment pipeline (commit-only)."
     )
-    parser.add_argument("--input", required=False, help="Path to input CSV file")
+    parser.add_argument("--input", required=True, help="Path to input CSV file")
     parser.add_argument(
-        "--output-dir", required=False, help="Directory to save output Parquet files"
+        "--output-dir", required=True, help="Directory to save output Parquet files"
     )
     parser.add_argument(
         "--batch-size", type=int, default=1000, help="Batch size for processing"
@@ -750,39 +490,29 @@ def main():
     )
     args = parser.parse_args()
 
-    # Priority: Args only (Env vars removed as requested)
-    INPUT_CSV = args.input
-    OUTPUT_DIR = args.output_dir
-    BATCH_SIZE = args.batch_size
-    ENABLE_MERGE = args.merge
-
-    # Set logging level from args (helps debugging during runs with many outputs)
     try:
         level = getattr(logging, args.log_level.upper(), logging.INFO)
         logging.getLogger().setLevel(level)
         logger.debug(f"Logging level set to {args.log_level}")
-        # Diagnostic: report active handlers
         active_handlers = [type(h).__name__ for h in logging.getLogger().handlers]
         logger.info(f"Active logging handlers: {active_handlers}")
     except Exception:
-        # Keep previous logger settings
         pass
 
-    if not INPUT_CSV or not OUTPUT_DIR:
+    input_csv = args.input
+    output_dir = args.output_dir
+    batch_size = args.batch_size
+    enable_merge = args.merge
+
+    if not input_csv or not output_dir:
         logger.error("INPUT_FILE and OUTPUT_DIR must be provided via args.")
         sys.exit(1)
 
-    # Ensure output dir exists
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     os.makedirs(args.repos_dir, exist_ok=True)
 
-    # Load Config & Setup Token Pool
-    config = load_config(CONFIG_PATH)
-
-    # Load tokens from Config
+    config = load_config(config_path)
     tokens = config.get("github_tokens", [])
-
-    # Check for Mongo
     mongo_uri = config.get("mongo_uri")
 
     if mongo_uri:
@@ -793,7 +523,6 @@ def main():
             logger.info(f"Initializing MongoTokenManager with DB {db_name}")
             token_manager = MongoTokenManager(mongo_uri, db_name)
 
-            # Seed tokens if provided and not in DB
             if tokens:
                 logger.info(f"Seeding {len(tokens)} tokens into MongoDB...")
                 for t in tokens:
@@ -807,23 +536,14 @@ def main():
         logger.info(f"Initializing TokenManager with {len(tokens)} tokens")
         token_manager = TokenManager(tokens)
 
-    # 1. Load Source
-    logger.info(f"Loading source data from {INPUT_CSV}")
-    # Use DuckDB to read CSV to avoid pandas segfaults on large files
+    logger.info(f"Loading source data from {input_csv}")
     try:
-        df_source = duckdb.read_csv(INPUT_CSV).df()
+        df_source = duckdb.read_csv(input_csv).df()
     except Exception as e:
         logger.error(f"Failed to read CSV with DuckDB: {e}")
         sys.exit(1)
 
-    # Initialize new columns
     new_cols = [
-        "gh_num_reviewers",
-        "gh_num_approvals",
-        "gh_time_to_first_review",
-        "gh_review_sentiment",
-        "gh_linked_issues_count",
-        "gh_has_bug_label",
         "file_change_frequency",
         "author_ownership",
     ]
@@ -831,35 +551,24 @@ def main():
         if col not in df_source.columns:
             df_source[col] = None
 
-    # 2. Check processed IDs using DuckDB
-    # We assume 'tr_build_id' is unique. If not, create a composite key or index.
-    # Let's assume tr_build_id is unique for now.
-
-    con = duckdb.connect(
-        database=":memory:"
-    )  # Use in-memory duckdb to scan parquet files
-
-    # Check if we have any parquet files
-    # Check if we have any parquet files
+    con = duckdb.connect(database=":memory:")
     processed_ids = set()
 
-    parquet_files = glob.glob(os.path.join(OUTPUT_DIR, "part_*.parquet"))
+    parquet_files = glob.glob(os.path.join(output_dir, "part_*.parquet"))
 
     if parquet_files:
         logger.info(
             f"Found {len(parquet_files)} existing parts. Scanning for processed IDs..."
         )
-        # DuckDB can read all parquet files at once: read_parquet('folder/*.parquet')
         try:
             processed_ids_df = con.execute(
-                f"SELECT tr_build_id FROM read_parquet('{os.path.join(OUTPUT_DIR, 'part_*.parquet')}')"
+                f"SELECT tr_build_id FROM read_parquet('{os.path.join(output_dir, 'part_*.parquet')}')"
             ).fetchdf()
             processed_ids = set(processed_ids_df["tr_build_id"])
             logger.info(f"Found {len(processed_ids)} processed rows.")
         except Exception as e:
             logger.warning(f"Could not read existing parquet files: {e}")
 
-    # Filter source
     df_to_process = df_source[~df_source["tr_build_id"].isin(processed_ids)]
     logger.info(f"Rows to process: {len(df_to_process)} (Total: {len(df_source)})")
 
@@ -867,34 +576,29 @@ def main():
         logger.info("All done!")
         return
 
-    # Sort by project to optimize cloning
     df_to_process = df_to_process.sort_values(by="gh_project_name")
 
-    # 3. Batch Processing
-    total_chunks = (len(df_to_process) // BATCH_SIZE) + 1
     chunks = [
-        df_to_process[i : i + BATCH_SIZE]
-        for i in range(0, len(df_to_process), BATCH_SIZE)
+        df_to_process[i : i + batch_size]
+        for i in range(0, len(df_to_process), batch_size)
     ]
+    total_chunks = len(chunks)
 
     missing_commits_log_path = os.path.join(
-        os.path.dirname(OUTPUT_DIR), "missing_commits_log.csv"
+        os.path.dirname(output_dir), "missing_commits_log.csv"
     )
 
     max_workers = config.get("max_workers", 5)
-    # Use a shared executor for all batches to avoid creating/destroying threads repeatedly
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for i, chunk in tqdm(
             enumerate(chunks), total=total_chunks, desc="Processing Batches"
         ):
             logger.info(f"Starting batch {i+1}/{len(chunks)}: rows={len(chunk)}")
             try:
-                # Determine projects to keep for the next batch
                 next_batch_projects = set()
                 if i + 1 < len(chunks):
                     next_batch_projects = set(chunks[i + 1]["gh_project_name"].unique())
 
-                # Process
                 df_enriched, logs = process_batch(
                     chunk.copy(),
                     config,
@@ -904,7 +608,6 @@ def main():
                     projects_to_keep=next_batch_projects,
                 )
 
-                # Save logs
                 if logs:
                     try:
                         with open(missing_commits_log_path, "a") as f:
@@ -913,10 +616,8 @@ def main():
                     except Exception as e:
                         logger.error(f"Failed to write logs: {e}")
 
-                # Save Batch to Parquet
-                # Use a timestamp or batch index in filename
                 batch_filename = f"part_{int(datetime.now().timestamp())}_{i}.parquet"
-                output_path = os.path.join(OUTPUT_DIR, batch_filename)
+                output_path = os.path.join(output_dir, batch_filename)
                 df_enriched.to_parquet(output_path, index=False)
                 logger.info(
                     f"Saved batch {i+1} file {output_path} (rows={len(df_enriched)})"
@@ -924,13 +625,12 @@ def main():
 
             except Exception as e:
                 logger.error(f"Error processing batch {i}: {e}")
-                # Continue to next batch? Yes.
                 continue
 
-    if ENABLE_MERGE:
-        merge_results(OUTPUT_DIR)
+    if enable_merge:
+        merge_results(output_dir)
 
-    logger.info("Pipeline finished.")
+    logger.info("Commit-only enrichment pipeline finished.")
 
 
 if __name__ == "__main__":

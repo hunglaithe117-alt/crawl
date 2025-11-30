@@ -22,7 +22,7 @@ import os
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, TypeVar
 
 import pandas as pd
 import pyarrow as pa
@@ -414,15 +414,18 @@ def ensure_outputs(
     return existing_path, missing_path
 
 
-def iter_unique(pairs: Iterable[Tuple[str, str]]) -> List[Tuple[str, str]]:
-    """Return unique pairs preserving order."""
+T = TypeVar("T")
+
+
+def iter_unique(items: Iterable[T]) -> List[T]:
+    """Return unique items preserving order."""
     seen = set()
-    unique: List[Tuple[str, str]] = []
-    for pair in pairs:
-        if pair in seen:
+    unique: List[T] = []
+    for item in items:
+        if item in seen:
             continue
-        seen.add(pair)
-        unique.append(pair)
+        seen.add(item)
+        unique.append(item)
     return unique
 
 
