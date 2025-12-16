@@ -1,50 +1,39 @@
-# Module Thu Thập & Làm Giàu Dữ Liệu (Crawler & Enrichment)
+# Module Thu Thập & Scan Dữ Liệu Build Logs (Crawler & Scanner)
 
-Module này xử lý việc thu thập dữ liệu và làm giàu các tính năng từ GitHub và TravisTorrent. Hệ thống được thiết kế để xử lý khối lượng dữ liệu lớn với các tính năng như quản lý token thông minh, tự động xoay IP trên Google Cloud, và tối ưu hóa việc gọi GitHub API (GraphQL & ETag caching).
+Module này xử lý việc thu thập dữ liệu từ GitHub, scan repositories để tìm build logs từ GitHub Actions/Travis CI, và làm giàu các tính năng. Hệ thống được thiết kế để xử lý khối lượng dữ liệu lớn với các tính năng như quản lý token thông minh, tự động xoay IP trên Google Cloud, tối ưu hóa GitHub API (GraphQL & ETag caching), và pipelines làm giàu dữ liệu.
 
 ## 🚀 Tính Năng Nổi Bật
 
-* **Quản Lý Token Thông Minh (Smart Token Management)**: Tự động xử lý các giới hạn rate limit (403/429), xoay vòng token, và thực hiện chiến lược "ngủ" thông minh dựa trên thời gian reset của token.
-* **Xoay IP Tự Động (GCE IP Rotation)**: Tích hợp với Google Cloud Compute Engine để tự động đổi địa chỉ IP Public của VM khi phát hiện bị chặn (429/403).
+* **Scan Repositories cho Build Logs**: Tự động tìm kiếm repos trên GitHub dựa trên filters (languages, stars, updated date), detect CI providers (GitHub Actions/Travis CI), và đánh giá khả năng thu thập logs (min_builds).
+* **Quản Lý Token Thông Minh (Smart Token Management)**: Tự động xử lý rate limits (403/429), xoay vòng token, và ngủ thông minh dựa trên reset time.
+* **Xoay IP Tự Động (GCE IP Rotation)**: Tích hợp Google Cloud để đổi IP khi bị chặn.
 * **Tối Ưu Hóa GitHub API**:
-  * **GraphQL**: Lấy thông tin Pull Request, reviews, comments, và labels chỉ trong 1 request thay vì nhiều REST calls rời rạc.
-  * **ETag Caching**: Sử dụng Conditional Requests (If-None-Match) để tiết kiệm quota API cho các tài nguyên chưa thay đổi.
+  * **GraphQL**: Lấy PR info, reviews, comments, labels trong 1 request.
+  * **ETag Caching**: Conditional requests để tiết kiệm quota.
 * **Pipelines Làm Giàu Dữ Liệu**:
-  * `github_enrichment.py`: Trích xuất các chỉ số PR, phân tích cảm xúc (sentiment analysis), và các mẫu review.
-  * `risk_features_enrichment.py`: Tính toán độ biến động code (churn), entropy, và quyền sở hữu của tác giả (author ownership).
+  * `github_enrichment.py`: Trích xuất metrics PR, sentiment analysis, review patterns.
+  * `risk_features_enrichment.py`: Tính churn, entropy, author ownership.
+* **Lưu Trữ MongoDB**: Persistent storage cho scan results và tokens.
 
 ## 🛠 Cài Đặt & Cấu Hình
 
 ### 1. Yêu Cầu Tiên Quyết
 
 * Python 3.9+
-* Google Cloud SDK (`gcloud`) đã được cài đặt và xác thực (nếu sử dụng tính năng xoay IP).
+* MongoDB (local hoặc remote)
+* Google Cloud SDK (`gcloud`) nếu dùng IP rotation
 * Git
 
 ### 2. Cài Đặt
 
-Di chuyển vào thư mục `crawl`:
-
 ```bash
-# 1. Cập nhật hệ thống
-sudo apt-get update
-
-# 2. Cài Python, pip và venv (môi trường ảo)
-sudo apt-get install -y python3-pip python3-venv git
-sudo apt-get install tmux
-sudo apt install htop -y
 cd crawl
-```
-
-Cài đặt các thư viện cần thiết:
-
-```bash
-pip install pandas requests pyyaml tqdm duckdb google-cloud-sdk
+uv sync  # Cài dependencies từ pyproject.toml
 ```
 
 ### 3. Cấu Hình
 
-Tạo các file cấu hình từ file mẫu:
+Copy và edit config files:
 
 ```bash
 cp crawler_config.example.yml crawler_config.yml
@@ -53,69 +42,89 @@ cp tokens.example.yml tokens.yml
 
 #### `tokens.yml`
 
-Thêm các GitHub Personal Access Tokens của bạn vào đây. Hệ thống sẽ sử dụng chúng theo cơ chế Round-Robin và cân bằng tải.
+Thêm GitHub/Travis tokens:
 
 ```yaml
 github_tokens:
   - "ghp_your_token_1..."
-  - "ghp_your_token_2..."
-  - "ghp_your_token_3..."
+travis_tokens: []  # Optional
 ```
 
 #### `crawler_config.yml`
 
-Điều chỉnh các cài đặt cho crawler.
+Cấu hình scan và API:
 
 ```yaml
-max_workers: 5                  # Số lượng luồng xử lý song song
-github_api_retry_count: 5       # Số lần thử lại khi request thất bại
-github_api_retry_delay: 1.0     # Thời gian chờ cơ bản (backoff)
+mongo_uri: "mongodb://localhost:27017"
+db_name: "ci_crawler"
+languages: ["Python", "Ruby", "Java"]
+min_stars: 50
+min_builds: 30
+max_workers: 5
+github_api_retry_count: 5
+github_api_retry_delay: 1.0
 # ...
 ```
 
-### 4. Cấu Hình Xoay IP Google Cloud (Tùy Chọn)
-
-Nếu chạy trên Google Cloud VM, hệ thống có thể tự đổi IP để vượt qua lỗi 429.
-
-1. **Quyền Hạn**: Đảm bảo Service Account của VM có quyền **Compute Instance Admin (v1)** (hoặc đủ quyền để cập nhật network interfaces).
-2. **Cấu Hình**: Script sẽ tự động phát hiện tên instance và zone. Bạn có thể ghi đè bằng biến môi trường:
-   * `GCE_INSTANCE_NAME`: Tên VM của bạn.
-   * `GCE_ZONE`: Zone (ví dụ: `us-central1-a`).
+Khởi động MongoDB nếu local.
 
 ## 🏃 Hướng Dẫn Sử Dụng
 
-### Làm Giàu Dữ Liệu GitHub (GitHub Enrichment)
+### Scan Repositories cho Build Logs
 
-Bổ sung thông tin về Pull Request, sentiment, thời gian review.
-
-```bash
-python enrich/github_enrichment.py \
-  --input /path/to/input.csv \
-  --output-dir /path/to/output_gh \
-  --merge
-```
-
-### Làm Giàu Tính Năng Rủi Ro (Risk Features Enrichment)
-
-Tính toán entropy, churn, và rủi ro thời gian build.
+Scan repos, detect CI, evaluate logs:
 
 ```bash
-python enrich/risk_features_enrichment.py \
-  --input /path/to/input.csv \
-  --output-dir /path/to/output_risk \
-  --merge
+uv run python scanner.py --config crawler_config.yml --limit 10 --verbose
 ```
 
-### Các Tham Số Chung
+Options:
+* `--limit <n>`: Max repos scan.
+* `--loop`: Scan vô hạn.
+* `--min-builds <n>`: Override min builds.
+* `--add-github-token <token>`: Thêm token động.
 
-* `--input`: Đường dẫn file CSV đầu vào (cần chứa `gh_project_name`, `git_trigger_commit`, v.v.).
-* `--output-dir`: Thư mục lưu các file Parquet đầu ra.
-* `--batch-size`: Số dòng xử lý mỗi batch (mặc định: 1000).
-* `--merge`: Nếu có cờ này, sẽ gộp tất cả file Parquet thành 1 file CSV cuối cùng.
-* `--no-mongo`: Bắt buộc sử dụng quản lý token trong bộ nhớ (mặc định trong phiên bản này).
+Kết quả lưu trong MongoDB collection `scan_results`.
+
+### Làm Giàu Dữ Liệu GitHub
+
+```bash
+python enrich/github_enrichment.py --input /path/to/input.csv --output-dir /path/to/output --merge
+```
+
+### Làm Giàu Tính Năng Rủi Ro
+
+```bash
+python enrich/risk_features_enrichment.py --input /path/to/input.csv --output-dir /path/to/output --merge
+```
+
+Tham số chung: `--input`, `--output-dir`, `--batch-size`, `--merge`, `--no-mongo`.
 
 ## 🏗 Kiến Trúc Hệ Thống
 
-* **`github_api_client.py`**: Client chính. Kiểm tra cờ `network_ready_event` trước mỗi request. Nếu đang xoay IP, tất cả các luồng sẽ tạm dừng.
-* **`token_pool.py`**: Class `TokenManager`. Theo dõi header `X-RateLimit-Remaining` và `X-RateLimit-Reset` để chọn token tốt nhất hoặc ngủ chờ token reset.
-* **`gce_rotator.py`**: Wrapper gọi lệnh `gcloud compute instances delete-access-config` và `add-access-config` để đổi IP ephemeral.
+* **`scanner.py`**: Entry point scan repos.
+* **`config.py`**: Load config từ YAML.
+* **`store.py`**: MongoDB interface cho scan results.
+* **`token_pool.py`**: Token management với rate limiting.
+* **`github_api_client.py`**: GitHub API client với retries.
+* **`manage_tokens.py`**: CLI tool quản lý tokens.
+* **`gce_rotator.py`**: IP rotation cho GCE.
+
+## 📊 Kết Quả Scan
+
+Status trong DB:
+* `ready`: Đủ logs downloadable.
+* `insufficient`: Ít logs.
+* `auth_failed`: Cần permissions.
+* `logs_gone`: Logs deleted.
+
+## 🔧 Troubleshooting
+
+* **Mongo Auth Error**: Đảm bảo Mongo chạy và URI đúng.
+* **Rate Limits**: Thêm tokens.
+* **Import Errors**: Chạy `uv sync`.
+
+## 📝 Notes
+
+* Sử dụng `--no-mongo` nếu không có MongoDB.
+* Tokens không commit vào Git.
