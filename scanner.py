@@ -12,8 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from .config import ScannerConfig, load_config
-from .store import ScanStore
+from config import ScannerConfig, load_config
+from store import ScanStore
 
 from token_pool import Token, TokenManager, MongoTokenManager
 from github_api_client import GitHubAPIClient

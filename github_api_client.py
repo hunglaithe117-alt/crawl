@@ -8,6 +8,7 @@ import threading
 import hashlib
 import json
 import os
+import yaml
 from typing import Any, Dict, List, Optional, Sequence
 import requests
 from requests.models import Response
@@ -15,45 +16,22 @@ from requests.models import Response
 # Try relative import first (for package usage), then absolute
 try:
     from .token_pool import TokenManager
-    from .gce_rotator import GCERotator
 except ImportError:
     from token_pool import TokenManager
-    from gce_rotator import GCERotator
 
 logger = logging.getLogger(__name__)
 
-# --- GLOBAL CONTROLS FOR IP ROTATION ---
-# Shared across all GitHubAPIClient instances
-network_ready_event = threading.Event()
-network_ready_event.set()  # Initially ready
-rotation_lock = threading.Lock()
-ip_rotator = GCERotator()
+# Load config for defaults
+def load_config():
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    CONFIG_PATH = os.path.join(BASE_DIR, "crawler_config.yml")
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return yaml.safe_load(f)
+    except Exception:
+        return {}
 
-
-def check_and_rotate_ip() -> None:
-    # Try to acquire lock non-blocking. If locked, rotation is already in progress.
-    if rotation_lock.acquire(blocking=False):
-        try:
-            logger.warning("🚨 DETECTED BLOCK (429). INITIATING IP ROTATION...")
-
-            # 1. Pause all workers
-            network_ready_event.clear()
-
-            # 2. Perform rotation
-            success = ip_rotator.rotate_ip()
-
-            if success:
-                logger.info("✅ IP Rotated successfully. Resuming crawlers...")
-            else:
-                logger.error("❌ IP Rotation Failed. Sleeping 60s instead.")
-                time.sleep(60)
-
-        except Exception as e:
-            logger.error(f"💥 Error during IP rotation: {e}")
-        finally:
-            # 3. Resume workers
-            network_ready_event.set()
-            rotation_lock.release()
+config = load_config()
 
 
 class GitHubAPIClient:
@@ -68,9 +46,9 @@ class GitHubAPIClient:
         repo: str,
         tokens: Optional[Sequence[str]] = None,
         token_manager: Optional[TokenManager] = None,
-        retry_count: int = 5,
-        retry_delay: float = 1.0,
-        cache_dir: Optional[str] = None,
+        retry_count: int = config.get("github_api_retry_count", 5),
+        retry_delay: float = config.get("github_api_retry_delay", 1.0),
+        cache_dir: Optional[str] = config.get("github_api_cache_dir"),
     ) -> None:
         """
         Initialize GitHub API client.
@@ -156,10 +134,6 @@ class GitHubAPIClient:
                     pass
 
         while True:
-            # 0. Check Network Ready Flag (Global Pause)
-            # If IP rotation is happening, this will block until it's done.
-            network_ready_event.wait()
-
             # 1. Acquire Token (Blocking)
             try:
                 token = self._token_manager.get_best_token()
@@ -231,11 +205,6 @@ class GitHubAPIClient:
                     )
                     self._token_manager.handle_rate_limit(token)
 
-                    # Trigger IP Rotation Logic
-                    # We spawn a thread to handle rotation so this worker can loop back and wait
-                    threading.Thread(target=check_and_rotate_ip).start()
-                    continue
-
                 if response.status_code == 403:
                     remaining = response.headers.get("X-RateLimit-Remaining")
                     if remaining == "0":
@@ -248,9 +217,7 @@ class GitHubAPIClient:
                 if 400 < response.status_code < 500:
                     # Check for spammy
                     if "spammy" in response.text.lower():
-                        logger.warning(
-                            f"🚫 Token {token.key} flagged as spammy."
-                        )
+                        logger.warning(f"🚫 Token {token.key} flagged as spammy.")
                         self._token_manager.disable_token(token)
                         continue
 

@@ -1,17 +1,41 @@
-# Default configuration for ci-crawler. Copy/adjust as needed.
+# Combined configuration for ci-crawler and build log scanner
 # Values here override environment variable defaults.
 
+# Mongo connection
 mongo_uri: "mongodb://localhost:27017"
 db_name: "ci_crawler"
 
+# Crawler settings
 max_workers: 5
+github_api_retry_count: 5
+github_api_retry_delay: 1.0
+github_api_cache_dir: /tmp/github_api_cache
+
+# Networking/retry tuning (shared)
 request_timeout: 30
 request_delay_seconds: 0.1
 retry_count: 3
 retry_base_delay_seconds: 0.1
 
-github_api_retry_count: 5
-github_api_retry_delay: 1.0
-github_api_cache_dir: /tmp/github_api_cache
-
+# API endpoints
 github_api_url: "https://api.github.com"
+travis_api_url: "https://api.travis-ci.com"
+
+# Discovery filters (for scanner)
+languages: ["Python", "Ruby", "Java"]
+min_stars: 50
+updated_since: "2025-11-01" # YYYY-MM-DD
+search_sort: "stars"
+search_order: "desc"
+search_per_page: 100
+search_pages: 10
+
+# Optional: auto-generate weekly created-date segments between these dates (YYYY-MM-DD).
+segment_start: "2018-12-01"
+segment_end: "2024-11-30"
+# Or provide explicit segments; leave empty to use start/end above.
+search_segments: []
+
+# Build/log requirements
+min_builds: 30
+sleep_on_429_seconds: 300
