@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+*.tmp
+.venv/
+.env
+.git/
+.pytest_cache/
+.DS_Store
+tokens.yml
+crawler_config.yml

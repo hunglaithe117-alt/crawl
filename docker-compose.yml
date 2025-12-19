@@ -1,0 +1,20 @@
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+
+  crawler:
+    build: .
+    depends_on:
+      - mongo
+    volumes:
+      - ./crawler_config.docker.yml:/app/crawler_config.docker.yml:ro
+      - ./tokens.yml:/app/tokens.yml:ro
+    command: ["--config", "/app/crawler_config.docker.yml"]
+
+volumes:
+  mongo_data:

@@ -68,6 +68,42 @@ github_api_retry_delay: 1.0
 
 Khởi động MongoDB nếu local.
 
+## Chạy bằng Docker
+
+### 1. Chuẩn bị
+
+```bash
+cp tokens.example.yml tokens.yml
+```
+
+Điền GitHub/Travis tokens vào `tokens.yml`. (Tối thiểu cần 1 GitHub token để tránh rate limit.)
+
+Tùy chỉnh cấu hình Docker tại `crawler_config.docker.yml` nếu cần. Mặc định MongoDB sẽ chạy trong container và được trỏ tới `mongodb://mongo:27017`.
+
+### 2. Build & chạy với Docker Compose
+
+```bash
+docker compose up --build
+```
+
+MongoDB data được lưu trong volume `mongo_data`. Dừng hệ thống:
+
+```bash
+docker compose down
+```
+
+### 3. Chạy một lần (override arguments)
+
+```bash
+docker compose run --rm crawler --config /app/crawler_config.docker.yml --limit 10 --verbose
+```
+
+Bạn có thể thêm các flags khác của `scanner.py` (vd: `--loop`, `--min-builds`).
+
+### 4. Dùng MongoDB bên ngoài (tuỳ chọn)
+
+Nếu muốn dùng MongoDB riêng, cập nhật `mongo_uri` trong `crawler_config.docker.yml` và bỏ service `mongo` trong `docker-compose.yml` (hoặc giữ nguyên nếu vẫn muốn chạy local).
+
 ## 🏃 Hướng Dẫn Sử Dụng
 
 ### Scan Repositories cho Build Logs
